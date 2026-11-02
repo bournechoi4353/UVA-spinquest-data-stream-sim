@@ -1,0 +1,42 @@
+# Six hours with a drift, spikes, a step shift, and a late decoupling.
+# Times are seconds from the start (hour 2 = 7200).
+seed: 2002
+start_time: "2026-01-01T08:00:00"
+duration_seconds: 21600
+
+channels:
+  - name: polarization
+    baseline: 41.0
+    sigma: 0.15
+    slow_wander: {amplitude: 0.04, period_seconds: 7200}
+  - name: beam_current
+    baseline: 5.0
+    sigma: 0.05
+  - name: rf_power
+    baseline: 100.0
+    sigma: 0.4
+    ar1_phi: 0.5
+  - name: target_temp
+    baseline: 1.0
+    sigma: 0.01
+    slow_wander: {amplitude: 0.003, period_seconds: 5400}
+  - name: nmr_signal
+    baseline: 2.5
+    sigma: 0.03
+    sample_rate_hz: 0.2
+    couples_to: {channel: polarization, gain: 0.15}
+
+anomalies:
+  # Slow drift on polarization: -3.5 over 3 h 20 min, starting at hour 2, and it stays there.
+  - {channel: polarization, type: linear_drift, start: 7200, duration: 12000,
+     magnitude: -3.5, magnitude_unit: absolute, hold_after: true}
+  # A few isolated spikes on beam_current.
+  - {channel: beam_current, type: spike, start: 3000, magnitude: 8}
+  - {channel: beam_current, type: spike, start: 9100, magnitude: -9}
+  - {channel: beam_current, type: spike, start: 15500, magnitude: 7}
+  # Step shift on rf_power at hour 4.
+  - {channel: rf_power, type: step_shift, start: 14400, magnitude: 2.4, magnitude_unit: absolute}
+  # nmr_signal stops following polarization while polarization is still drifting (hour 4.5)
+  # and stays decoupled to the end of the run.
+  - {channel: nmr_signal, type: decoupling, start: 16200, duration: 3600,
+     hold_after: true}
