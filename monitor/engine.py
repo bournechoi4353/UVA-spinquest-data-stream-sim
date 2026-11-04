@@ -87,6 +87,8 @@ class Engine:
         if adaptive:
             engine._calibrate_couplings(healthy)
         engine._calibrate_missing(healthy)
+        engine._calibrate_feeds(healthy)
+        engine.calibration_counts = {k: len(v) for k, v in vals.items()}
         return engine
 
     def _calibrate_missing(self, healthy: list[tuple[datetime, dict[str, float]]]) -> None:
@@ -118,6 +120,41 @@ class Engine:
                 n = 1.5 * math.log(per_window) / -math.log(q)
                 limit = (n + 1) * m.cal.period_s
                 m.cal.missing_after_s = max(m.cal.missing_after_s or 0.0, limit)
+
+    def _calibrate_feeds(self, healthy: list[tuple[datetime, dict[str, float]]]) -> None:
+        """Each feed's outage limit from its healthy gaps between rows.
+
+        Real feeds pause for tens of seconds now and then while healthy, so a fixed 5 periods
+        (about 9 s for QT) would raise an outage about once an hour. The limit is 1.5 times the
+        largest healthy gap, at least outage_periods periods, and at most outage_max_s, so a
+        real outage inside the calibration window cannot raise the limit to hours.
+        """
+        for feed, keys in self.feed_members.items():
+            w = self.feed_watch.get(feed)
+            if w is None:
+                continue
+            last, largest, rows = None, 0.0, 0
+            for t, ev in healthy:
+                if any(k in ev for k in keys):
+                    rows += 1
+                    if last is not None:
+                        largest = max(largest, (t - last).total_seconds())
+                    last = t
+            if rows < 100:
+                continue
+            floor = self.s.outage_periods * w.period_s
+            w.limit_s = min(max(1.5 * min(largest, self.s.outage_max_s), floor), max(self.s.outage_max_s, floor))
+
+    def coverage(self) -> list[tuple[str, str]]:
+        """Channels of a feed that are not monitored, with the reason (for reports, not the model)."""
+        counts = getattr(self, "calibration_counts", {})
+        out = []
+        for feed, keys in self.feed_members.items():
+            for k in keys:
+                if k not in self.monitors:
+                    n = counts.get(k, 0)
+                    out.append((k, f"not monitored: {n} values in the calibration window (needs 10)"))
+        return out
 
     def _calibrate_couplings(self, healthy: list[tuple[datetime, dict[str, float]]]) -> None:
         """Residual sigma and threshold of every coupling watch from healthy events."""

@@ -17,7 +17,9 @@ Detectors inside a ChannelMonitor (all causal, one sample at a time):
 4. noisy      an EWMA of squared sample-to-sample differences above
               noisy_ratio^2 (default 2^2) times its healthy level, for noisy_hold samples.
 5. missing    missing_samples NaN readings in a row (a dropout).
-Per feed (FeedWatch): no row for outage_periods periods (a feed outage).
+Per feed (FeedWatch): no row for longer than its limit (a feed outage). The limit is
+outage_periods periods, or, after Engine calibration, 1.5 times the largest healthy
+gap between rows, kept between outage_periods periods and outage_max_s.
 Per coupled pair (CouplingWatch): CUSUM on the residual of the coupled
 channel after removing gain * source deviation (decoupled).
 
@@ -54,7 +56,12 @@ class DetectorSettings:
     noisy_alpha: float = 0.02
     noisy_hold: int = 30
     missing_samples: int = 3
+    drift_min_sigma: float = 1.0     # a drift alarm needs the recent mean deviation to be at least this
+    drift_clear_s: float = 1800.0    # an active drift ends after this long with the recent deviation below it
+    dev_alpha: float = 0.01          # EWMA weight of the recent mean deviation (about 100 samples)
+    drift_rearm_sigma: float = 2.0   # after a drift ends by settling, the same side needs this much to raise again
     outage_periods: float = 5.0
+    outage_max_s: float = 300.0     # calibrated outage limits never exceed this (5 min)
     decouple_threshold: float = 8.0
 
 
@@ -115,15 +122,30 @@ STUCK_NORMAL_SHARE = 0.2        # healthy share of repeated consecutive values a
 MISSING_GAP_QUANTILE = 99.9
 MISSING_GAP_FACTOR = 2.0
 MISSING_MIN_PERIODS = 10.0
+MISSING_LARGEST_FACTOR = 1.5    # a channel may go 1.5 x its largest healthy gap without a value ...
+MISSING_LARGEST_MAX_S = 300.0   # ... but that rule never asks for more than 5 minutes
+FLAT_SIGMA_REL = 1e-3           # sigma of a channel that was constant in calibration: 0.1% of its level (min 1e-3)
+SPREAD_Z = 4.653                # P99 - P1 of a Gaussian, in sigma
+HELD_DIFF_VAR = 0.5             # healthy noise reference floor for holding and constant channels
 
 
 def calibrate(values: np.ndarray, times_s: np.ndarray | None = None, default_period_s: float = 1.0) -> Calibration:
     """Robust target and sigma from healthy values (NaN ignored).
 
     Real channels can be quantized, hold values for long stretches, or be constant (a channel that
-    is not connected). Then the MAD is 0, and sigma falls back to the smallest step seen, or for a
-    constant channel to a tiny floor, so the detectors stay defined. Channels that repeat values
-    often when healthy get ``stuck_normal`` (stuck detection off).
+    is not connected). The MAD then badly underestimates how much the channel moves: a level sensor
+    that toggles between two readout codes, or a temperature that updates in steps, has a MAD close
+    to 0, and every normal update would look like a many-sigma spike (seen on real ptdb data, QT
+    LIT501 and FC502, 2025-11). So:
+
+    * channels that hold values (repeat share above STUCK_NORMAL_SHARE) get the largest of the MAD
+      sigma, the central-98% spread in sigma units ((P99 - P1) / 4.653), and the median size of a
+      non-zero update (so one ordinary update is at most 1 sigma);
+    * a channel that was constant during calibration gets FLAT_SIGMA_REL of its level (at least
+      1e-3), so a small later change is not thousands of sigma;
+    * holding channels also get ``stuck_normal`` (stuck detection off).
+
+    Channels that do not hold values keep the plain MAD sigma.
     """
     v = np.asarray(values, dtype=float)
     v = v[np.isfinite(v)]
@@ -134,12 +156,16 @@ def calibrate(values: np.ndarray, times_s: np.ndarray | None = None, default_per
     steps = np.abs(np.diff(v))
     repeat_share = float((steps == 0).mean()) if len(steps) else 0.0
     flat = bool(np.all(v == v[0]))
-    if sigma <= 0:
-        nonzero = steps[steps > 0]
-        if len(nonzero):
-            sigma = max(float(np.std(v)), float(nonzero.min()), 1e-9 * max(abs(target), 1.0))
-        else:
-            sigma = 1e-6 * max(abs(target), 1.0)
+    nonzero = steps[steps > 0]
+    if flat:
+        sigma = FLAT_SIGMA_REL * max(abs(target), 1.0)
+    elif repeat_share > STUCK_NORMAL_SHARE:
+        lo, hi = np.percentile(v, [1.0, 99.0])
+        sigma = max(sigma, float(hi - lo) / SPREAD_Z, float(np.median(nonzero)) if len(nonzero) else 0.0,
+                    1e-9 * max(abs(target), 1.0))
+    elif sigma <= 0:
+        sigma = max(float(np.std(v)), float(nonzero.min()) if len(nonzero) else 0.0,
+                    1e-9 * max(abs(target), 1.0))
     period = default_period_s
     missing_after = None
     if times_s is not None and len(times_s) > 2:
@@ -149,9 +175,15 @@ def calibrate(values: np.ndarray, times_s: np.ndarray | None = None, default_per
         if len(d):
             period = float(np.mean(d[d < 5 * np.median(d)])) if np.median(d) > 0 else float(np.mean(d))
             missing_after = max(MISSING_GAP_FACTOR * float(np.percentile(d, MISSING_GAP_QUANTILE)),
-                                MISSING_MIN_PERIODS * period)
+                                MISSING_MIN_PERIODS * period,
+                                MISSING_LARGEST_FACTOR * min(float(d.max()), MISSING_LARGEST_MAX_S))
     d = np.diff(v) / (sigma * math.sqrt(2.0))
     diff_var = float(np.mean(np.minimum(d * d, 25.0))) if len(d) > 5 else 1.0
+    if flat or repeat_share > STUCK_NORMAL_SHARE:
+        # Mostly zero differences make the healthy noise level close to 0, and then any burst of
+        # ordinary updates is "noisy". Floor it at HELD_DIFF_VAR (updates of one sigma on every
+        # other sample count as healthy).
+        diff_var = max(diff_var, HELD_DIFF_VAR)
     return Calibration(target, sigma, period, diff_var=max(diff_var, 1e-6),
                        stuck_normal=flat or repeat_share > STUCK_NORMAL_SHARE, flat=flat,
                        missing_after_s=missing_after)
@@ -244,6 +276,10 @@ class ChannelMonitor:
         self.up_since: datetime | None = None
         self.dn_since: datetime | None = None
         self.drift: Condition | None = None
+        self.dev_ewma: float | None = None       # recent mean deviation from target, channel units
+        self.small_since: datetime | None = None  # when the active drift's deviation fell below drift_min_sigma
+        self.calm_count = 0                      # samples in a row with the noise EWMA below its clear level
+        self.armed = {"drift_up": True, "drift_down": True}   # False after a settled clear, until the CUSUM is 0
         self.last_value: float | None = None
         self.last_time: datetime | None = None
         self.repeat = 0
@@ -311,24 +347,50 @@ class ChannelMonitor:
         if prev_dn == 0 and self.s_dn > 0:
             self.dn_since = t
         dev = x - cal.target
+        self.dev_ewma = dev if self.dev_ewma is None else self.dev_ewma + s.dev_alpha * (dev - self.dev_ewma)
+        # The magnitude gate and settling are part of the adaptive mode (cusum_h set by
+        # adapt_thresholds); the plain Phase 5 mode keeps the bare CUSUM as its baseline.
+        gated = cal.cusum_h is not None
+        big = s.drift_min_sigma * cal.sigma if gated else -math.inf
+        if self.s_up == 0.0:
+            self.armed["drift_up"] = True
+        if self.s_dn == 0.0:
+            self.armed["drift_down"] = True
         if self.drift is None:
-            if self.s_up > self.h:
+            # The CUSUM decides that the level moved; the recent mean deviation must also be at
+            # least drift_min_sigma, so a channel sitting just above the slack is not "abnormal".
+            # After a drift ended by settling, the same side needs drift_rearm_sigma until the
+            # channel has really come back (its CUSUM reached 0), so it does not flap.
+            need_up = big if self.armed["drift_up"] else s.drift_rearm_sigma * cal.sigma
+            need_dn = big if self.armed["drift_down"] else s.drift_rearm_sigma * cal.sigma
+            if self.s_up > self.h and self.dev_ewma >= need_up:
                 self.drift = Condition(self.key, "drift_up", self.up_since or t, t)
                 out.append(self.drift)
-            elif self.s_dn > self.h:
+            elif self.s_dn > self.h and -self.dev_ewma >= need_dn:
                 self.drift = Condition(self.key, "drift_down", self.dn_since or t, t)
                 out.append(self.drift)
+            self.small_since = None
         if self.drift is not None:
-            score = self.s_up if self.drift.kind == "drift_up" else self.s_dn
+            up = self.drift.kind == "drift_up"
+            score = self.s_up if up else self.s_dn
             # Magnitude: a slow EWMA of the deviation while the alarm is active.
             m = self.drift.magnitude
             self.drift.magnitude = dev if m is None else m + 0.05 * (dev - m)
             self.drift.magnitude_sigma = self.drift.magnitude / cal.sigma
             self.drift.peak_sigma = max(self.drift.peak_sigma or 0.0, abs(self.drift.magnitude_sigma))
-            if score == 0.0:
+            small = (self.dev_ewma < big) if up else (self.dev_ewma > -big)
+            if small:
+                self.small_since = self.small_since or t
+            else:
+                self.small_since = None
+            settled = gated and small and (t - self.small_since).total_seconds() >= s.drift_clear_s
+            if score == 0.0 or settled:
                 self.drift.active, self.drift.ended_at = False, t
                 out.append(self.drift)
                 self.drift = None
+                self.small_since = None
+                if settled:          # this side needs a clearly larger change before it raises again
+                    self.armed["drift_up" if up else "drift_down"] = False
 
         # 3. stuck: identical consecutive values
         if self.last_value is not None and x == self.last_value:
@@ -364,10 +426,18 @@ class ChannelMonitor:
                 self.noisy.detail["noise_ratio"] = _round(ratio)
         else:
             self.noisy_count = 0
-            if self.noisy is not None and self.var_ewma < 0.5 * (cal.diff_var + self.noisy_level):
+        # The noise alarm ends only after noisy_hold samples in a row below the clear level (halfway
+        # between healthy and the threshold), so noise hovering at the threshold does not flap.
+        if self.noisy is not None:
+            if self.var_ewma < 0.5 * (cal.diff_var + self.noisy_level):
+                self.calm_count += 1
+            else:
+                self.calm_count = 0
+            if self.calm_count >= s.noisy_hold:
                 self.noisy.active, self.noisy.ended_at = False, t
                 out.append(self.noisy)
                 self.noisy = None
+                self.calm_count = 0
 
         self.last_value, self.last_time = x, t
         return out
@@ -393,11 +463,16 @@ class FeedWatch:
         self.last_row = t
         return out
 
+    limit_s: float | None = None   # set by Engine calibration from healthy row gaps; else outage_periods
+
+    def limit(self) -> float:
+        return self.limit_s if self.limit_s is not None else self.s.outage_periods * self.period_s
+
     def tick(self, now: datetime) -> list[Condition]:
         if self.last_row is None or self.outage is not None:
             return []
         gap = (now - self.last_row).total_seconds()
-        if gap > self.s.outage_periods * self.period_s:
+        if gap > self.limit():
             self.outage = Condition(self.feed, "feed_outage", self.last_row, now,
                                     detail={"gap_s": _round(gap)})
             return [self.outage]

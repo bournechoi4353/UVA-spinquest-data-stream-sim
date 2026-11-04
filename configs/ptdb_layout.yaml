@@ -15,7 +15,7 @@
 #   rows look like partial rows from more than one writer in the same second
 # - every Lakeshore_Fridge_Temp channel read exactly 0 in all samples: the mentor confirmed the
 #   sensors are not connected yet, so that feed is deferred. QT is included instead (its sensors
-#   are finalized); its period is provisional until QT is profiled.
+#   are finalized); its period was measured by the QT profile (2026-11-04).
 # - TODO: SHOW CREATE TABLE for tables other than Labjack, Flow_Rates, Lakeshore_Fridge_Temp
 #   (assumed here: same id primary key and Timestamp index)
 # - TODO: sentinel value convention for failed reads (root_exhaust_pressure has a median of -41030.7,
@@ -185,7 +185,7 @@ tables:
     time_zone_assumed: false
     timestamp_resolution_s: 1  # assumed like the other timestamp tables; confirm with the QT profile
     include: true  # mentor (2026-11-03): QT sensors are finalized and have lots of data
-    nominal_period_s: 1.0  # PROVISIONAL: QT is not profiled yet; replace with its measured mean spacing
+    nominal_period_s: 1.878  # measured mean spacing while running (QT profile, 2026-11-04; median 2 s, 19% shared timestamps)
     channels:
       - {db_column: fc501_ai, display_name: "FC501 flow", unit: null, group: flow, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
       - {db_column: fc501_out, display_name: "FC501 controller output", unit: null, group: flow, group_inferred: true, role: controller_output, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}

@@ -58,7 +58,7 @@ def test_included_feeds_follow_the_mentor(reg):
 
 def test_included_feeds_have_period_time_column_and_resolution(reg):
     periods = {t.name: t.nominal_period_s for t in reg.included_tables()}
-    assert periods == {"Flow_Rates": 1.354, "Labjack": 1.105, "QT": 1.0}   # measured, QT provisional
+    assert periods == {"Flow_Rates": 1.354, "Labjack": 1.105, "QT": 1.878}   # all measured while running
     for t in reg.included_tables():
         assert t.time_column == "Timestamp"
         assert t.timestamp_resolution_s == 1

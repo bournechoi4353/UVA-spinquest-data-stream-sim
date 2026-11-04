@@ -46,7 +46,7 @@ Everything in this repo runs on synthetic data. No real experiment data is store
 | LLM | Q&A dataset, LoRA training, evaluation | Done: Qwen3.5-4B LoRA trained on Shannon, 100% on held-out phrasings (see [LLM training](#llm-training)) |
 | Bot | Discord bot | Done (not connected to Discord) |
 
-Tests: 245 passing (`pytest`).
+Tests: 255 passing (`pytest`).
 
 ## Runbook: run everything on another computer
 
@@ -59,7 +59,7 @@ This section is a complete, ordered checklist. It covers getting the code, the t
 | Python 3.11+ | everything | 3.14 (Windows laptop), 3.12.3 (`/usr/bin/python3` on Shannon) |
 | Linux + NVIDIA GPU, 48 GB for the default batch size | training and model answers | RTX A6000 48 GB, driver 590.48.01, peak about 41 GB at batch 16 |
 | About 25 GB of disk | training env (7.2 GB), model cache (12 GB), pip cache (5.7 GB) | `~/spinquest-discord-anomaly-checker` on Shannon |
-| Network access to `twist.phys.virginia.edu:3306` | profiler, real-data test, live monitor | Shannon can reach it (use the full name: plain `twist` does not resolve there) |
+| An SSH tunnel to the database on twist | profiler, real-data test, live monitor | From Shannon: `ssh -N -L 3307:127.0.0.1:3306 ptgroup@twist.phys.virginia.edu`, then connect to `127.0.0.1` port `3307` (see R.5) |
 | A read-only-capable ptdb account | same | `uvaspin`; the password is typed in by you and never stored |
 
 Steps R.1 to R.4 run on any computer, Windows included. Steps R.5 to R.10 need the database or the GPU, so run them on a Linux machine like Shannon. Training was tested only on Linux. flash-linear-attention uses Triton, which does not support Windows.
@@ -96,7 +96,7 @@ Files that are not in git (all under `out/`, gitignored) and whether you need th
     .venv/bin/pip install -r requirements.txt          # Windows: .venv/Scripts/python -m pip install -r requirements.txt
     .venv/bin/python -m pytest -q
 
-Expected result: `245 passed`, in about 75 s.
+Expected result: `255 passed`, in about 75 s.
 
 ### R.3 Simulated data and the detector benchmark
 
@@ -104,7 +104,7 @@ Expected result: `245 passed`, in about 75 s.
     .venv/bin/python scripts/score_detectors.py out/batch --split all        # adaptive thresholds
     .venv/bin/python scripts/score_detectors.py out/batch --split all --plain
 
-Expected result: 0.049 false alarms per hour on clean runs with adaptive thresholds (65.9 with `--plain`). The per-type rates are in [Detector results](#detector-results-phase-5).
+Expected result: 0.021 false alarms per hour on clean runs with adaptive thresholds (65.9 with `--plain`). The per-type rates are in [Detector results](#detector-results-phase-5).
 
 ### R.4 The real layout, wide feeds and the fit to the profile
 
@@ -118,13 +118,22 @@ Expected end-to-end result per seed: 7 of 7 planted anomalies found, 0 to 2 fals
 
 ### R.5 Profile the real database (you, by hand, read-only)
 
+The database runs on twist, and it is reached from Shannon through an SSH tunnel. Use two terminals on Shannon:
+
+    # terminal 1: the tunnel (asks for the ptgroup password, then looks like it hangs: that is correct)
+    ssh -N -L 3307:127.0.0.1:3306 ptgroup@twist.phys.virginia.edu
+
+    # terminal 2: the profiler, real-data test or monitor; at the prompts enter host 127.0.0.1, port 3307
+
+Keep terminal 1 open until the job finishes, then press Ctrl+C there. If the SSH connection to Shannon drops, both jobs stop. Nothing breaks, but you must start again. `tmux` keeps them alive if Shannon has it.
+
     cd ~/spinquest-discord-anomaly-checker
     bash scripts/shannon_profile.sh                                   # Flow_Rates, Labjack, Lakeshore_Fridge_Temp (done 2026-11-03)
     TABLES=QT OUT=out/profile_qt bash scripts/shannon_profile.sh      # QT only (not done yet; R.9 also does it)
 
 The script does four things in order:
 1. Builds `.venv-profile` (172 MB, only the profiler's packages).
-2. Asks for the host (`twist.phys.virginia.edu`), the port (`3306`), the user and the password. The password is not shown or stored.
+2. Asks for the host, port, user and password. Enter host `127.0.0.1` and port `3307` (the tunnel below). The password is not shown or stored.
 3. Prints the dry run and waits for your yes.
 4. Runs at low CPU and IO priority, with a 0.5 s pause after each query.
 
@@ -179,30 +188,48 @@ This needs `out/qa_v2` (R.6 with `--out out/qa_v2`). It runs the end-to-end test
     cd ~/spinquest-discord-anomaly-checker
     bash scripts/shannon_realtest.sh
 
-This needs `.venv-profile` (R.5) and, for step 4, `.venv-train` and `out/model/adapter`. It asks for the password once. Settings are environment variables:
-- `SINCE` (UTC start, default `2026-08-14T19:10:00`, the start of the latest logger run);
-- `CAL_HOURS` (default 12);
-- `TEST_HOURS` (default 24);
+This needs the tunnel from R.5 open in another terminal, `.venv-profile` (R.5) and, for step 5, `.venv-train` and `out/model/adapter`. At the prompts, press Enter for host `127.0.0.1` and port `3307` (the tunnel). It asks for the password once. Settings are environment variables:
+- `SINCE` (UTC start, default `2025-11-01T00:00:00`);
+- `CAL_HOURS` (default 72, so the test week is 2025-11-04 to 11-10, the same week as the first run);
+- `TEST_HOURS` (default 144, which is 6 days);
+- `NAME` (default `real_<SINCE date>`);
+- `PROFILE_QT=1` to profile QT again;
 - `PAUSE` (default 0.5 s).
+
+**Why that window.** October 2025 to January 2026 is the longest stretch in which Flow_Rates, Labjack and QT all logged normally. The first real test (2026-11-04) started at 2026-08-14 19:10. All three tables have a gap from 08-14 19:05 to 08-17 19:10, then only 2 h 19 min of data, and ptdb ends at **2026-08-17 21:29:08 UTC**. In that last stretch:
+- logging ran at a third of the usual rate;
+- Labjack had no values;
+- two Flow_Rates columns were empty.
+
+All the data went into calibration, so nothing was tested.
 
 | Step | What | Estimated time |
 |---|---|---|
-| 1 | Profile QT, aggregates only, about 300 statements | 5 to 15 min |
-| 2 | Set QT's `nominal_period_s` in `configs/ptdb_layout.yaml` from the profile | seconds |
-| 3 | Monitor: find the start row by binary search on `id` (about 25 primary-key lookups per table), read 36 h of Flow_Rates, Labjack and QT (about 350k rows, pages of 5,000), calibrate on 12 h, monitor 24 h | 5 to 15 min |
-| 4 | Five questions to the fine-tuned model (each loads the model, about 1 min) | about 5 min |
+| 1 | Profile QT, aggregates only, about 300 statements; skipped if `out/profile_qt/` exists | 0 (done 2026-11-04) |
+| 2 | Set QT's `nominal_period_s` from the profile (1.878 s, already in the layout) | seconds |
+| 3 | Monitor: find the start row by binary search on `id` (about 25 primary-key lookups per table), read 9 days of Flow_Rates, Labjack and QT (about 1.6 million rows, pages of 5,000, 0.5 s pause), calibrate on 72 h, monitor 6 days | 15 to 40 min |
+| 4 | Digest of every alarm | seconds |
+| 5 | Five questions to the fine-tuned model (each loads the model, about 1 min) | about 5 min |
 
-Total: about 20 to 40 minutes. The outputs are `out/profile_qt/ptdb_profile.md`, `out/monitor/real/summary.txt`, `snapshots.jsonl` and `answers.txt`. Review them before sharing. Every statement passes the read-only guard, and the session is `READ ONLY` with a 30 s timeout per query. A timeout cancels that query and leaves the database untouched.
+The outputs are in `out/monitor/<NAME>/`:
+- `digest.txt`: alarm counts, rates per hour, durations, spikes per channel, the longest outages, and alarms per day;
+- `coverage.txt`: monitored and unmonitored channels with the reason, and each feed's outage limit;
+- `alarms.jsonl`: every condition;
+- `summary.txt`, `state.json` and `answers.txt`.
+
+Review them before sharing. Every statement passes the read-only guard, and the session is `READ ONLY` with a 30 s timeout per query. A timeout cancels that query and leaves the database untouched.
 
 What to look at:
-- **Alarms in the 24 h:** each one is either a real event (ask Jay) or a false alarm, such as a mode change or a held value.
-- **The QT period:** check the measured value in the profile.
+- **`coverage.txt`:** all 29 channels should be monitored. Any that are not are named, with the reason.
+- **Alarm rates per channel in `digest.txt`:** each alarm is either a real event (ask Jay) or a false alarm, for example a mode change, a held value, or the separator flow jumps of about 0.5.
+- **Feed outages:** with limits learned from healthy gaps, these should be real logger pauses.
 
 ### R.10 Live monitoring and the Discord bot (GPU machine)
 
 Live monitor: it backfills from `--since`, calibrates on the first 12 h, then keeps polling every 30 s and rewrites `summary.txt`:
 
-    export PTDB_HOST=twist.phys.virginia.edu PTDB_PORT=3306 PTDB_USER=uvaspin PTDB_DATABASE=ptdb
+    # with the tunnel from R.5 open in another terminal
+    export PTDB_HOST=127.0.0.1 PTDB_PORT=3307 PTDB_USER=uvaspin PTDB_DATABASE=ptdb
     read -r -s -p "Password: " PTDB_PASSWORD; echo; export PTDB_PASSWORD
     SINCE=$(date -u -d '-12 hours' +%Y-%m-%dT%H:%M:%S)
     .venv-profile/bin/python scripts/run_monitor.py --mysql --since "$SINCE" --calibrate-minutes 720 \
@@ -245,7 +272,12 @@ What was done, in order, with what was decided and why.
 | 2026-11-03 22:33 to 23:57 | Training plus evaluation on Shannon (A6000), in `.venv-train` inside the project folder | 1 epoch, validation loss 0.0029; 100% on `test` and `test_holdout` |
 | 2026-11-04 00:34 to 00:57 | Post-training checks | End to end with the model: 14 of 14 detected, 1 false alarm, 244 of 244 answers; QT-name set 100% |
 | 2026-11-04 | Live reader fix | `start_at_time` used `WHERE Timestamp >= ...`, which could scan millions of rows on an unindexed column and hit the 30 s timeout. It now binary-searches on the primary key (20 to 25 lookups per table). It is tested against a brute-force search, with id gaps, outages and late rows |
-| next | Real-data test (R.9), the operating-modes question for Jay, Discord setup (R.10) | Waiting on you |
+| 2026-11-04 | Latency test of the fine-tuned model on the A6000 | 1.4 to 4.9 s per answer, growing with answer length (about 15 tokens/s); all answers correct |
+| 2026-11-04 | QT profile and first real-data test (`SINCE=2026-08-14T19:10`) | QT: mean spacing 1.878 s, no NULLs, values held 97 to 99.6% of rows, temperatures in kelvin (about 279 K), on/off and two-level channels. The test window held only 2 h 19 min of data (ptdb ends 2026-08-17 21:29 UTC), so nothing was tested. 10 channels were silently unmonitored (no values). Separator flow had single-reading jumps of about ±0.5 in about 9% of its readings, with a clear gap between them and the normal 0.03 spread, so they are a data pattern, not noise (question sent to Jay) |
+| 2026-11-04 | Fixes for the second real test | Feed-outage limits learned from healthy gaps; `coverage.txt` names unmonitored channels; `alarms.jsonl` logs every condition; `scripts/summarize_alarms.py` digest; default window 2025-11-03 + 24 h calibration + 6 days; QT period 1.878 s in the layout. 249 tests |
+| 2026-11-04 | Second real-data test: 2025-11-04 to 11-10 (6 days), 24 h calibration (`real_2025-11-03`) | All 29 channels monitored; outage limits about 145 s. 1,086 alarms (7.5/h). About 70% came from four patterns: LIT501 toggling between two readout codes (474), FC502 constant in calibration (135), one Flow_Rates writer absent about 60% of the week (magnet, main and separator flow, 120), and a Labjack gap every midnight Eastern (34). Many noisy and drift alarms were the same condition switching on and off. Candidate real events for Jay: a 2.5 min logger pause at 11-05 05:01 UTC; PT502 down at 11-06 03:38; magnet temperatures up at 11-06 07:10; PT503 down at 11-08 11:05; magnet flow up at 11-08 14:44; a TI523 noise burst at 11-08 15:41. Separator flow's fixed-size jumps (median 0.50) and main flow's (median 0.21) appear here too. The model answered all 5 questions correctly from the summary |
+| 2026-11-04 | Fixes from that test | Held-value and constant-channel sigma; a 1 sigma drift gate with settling and re-arming; noise hysteresis; missing limit at least 1.5 times the largest healthy gap; digest episodes and "channels that alarm together". The plain baseline is unchanged. Simulated benchmark: detection rates unchanged, false alarms 0.049 to 0.021 per hour, drifts detected later (median 83 s instead of 3 s); end to end 21 of 21 over 3 seeds, 0 false alarms. 255 tests |
+| next | Third real-data test on the same week with 72 h calibration (`real_2025-11-01`) to compare with `real_2025-11-03`; Jay's answers (separator flow, the logger stopping on 2026-08-17, modes, the candidate events); Discord setup (R.10) | Waiting on you |
 
 ## Setup
 
@@ -664,7 +696,7 @@ The first read-only profile covered Flow_Rates, Labjack and Lakeshore_Fridge_Tem
 
 Fitting the simulator to this profile (`scripts/compare_sim_to_profile.py`) matches the short-term noise sigma and lag-1 autocorrelation of 20 of 21 channels. The exception is `heat_exchanger_flow`, which is held constant 81 percent of the time. That match is narrow: the fit does not reproduce modes, sentinel values, held values or long outages.
 
-**Feeds now included (mentor, 2026-11-03):** Flow_Rates, Labjack and QT, 29 channels in total. The QT sensors are finalized and have lots of data. QT display names are inferred from the instrument tags (FC flow controller, LIT level, PT pressure, AIT analyzer, TI temperature, `_out` controller output). QT's period is a provisional 1.0 s until QT is profiled:
+**Feeds now included (mentor, 2026-11-03):** Flow_Rates, Labjack and QT, 29 channels in total. The QT sensors are finalized and have lots of data. QT display names are inferred from the instrument tags (FC flow controller, LIT level, PT pressure, AIT analyzer, TI temperature, `_out` controller output). QT was profiled on 2026-11-04 (mean spacing 1.878 s, now in the layout). To profile it again:
 
     cd ~/spinquest-discord-anomaly-checker
     TABLES=QT OUT=out/profile_qt bash scripts/shannon_profile.sh
@@ -678,11 +710,11 @@ After that, set `nominal_period_s` for QT in `configs/ptdb_layout.yaml` to the p
 | Detector | Rule |
 |---|---|
 | spike | \|z\| > 5 against an adaptive mean (alpha 0.01, not updated on flagged points). Confirmed only when the next sample is back within 3 sigma and the value is at least 3 sigma from the healthy target, so a step is not reported as a spike |
-| drift_up, drift_down | Two-sided CUSUM against the frozen target: slack 0.5 sigma, inputs clipped to 3 sigma, `since` = when the score left zero, score capped at 2 h so it clears soon after recovery |
+| drift_up, drift_down | Two-sided CUSUM against the frozen target: slack 0.5 sigma, inputs clipped to 3 sigma, `since` = when the score left zero, score capped at 2 h so it clears soon after recovery. In the adaptive mode, the recent mean deviation (an EWMA over about 100 samples) must also be at least 1 sigma. The alarm ends after 30 minutes below 1 sigma, and after that the same side needs 2 sigma until its CUSUM returns to 0, so a channel sitting just above the slack neither alarms nor flaps |
 | stuck | The same value for at least 20 samples and 60 s |
-| noisy | An EWMA of squared sample-to-sample differences above 4 times its healthy level (level changes do not count as noise) |
-| missing | 3 or more missing readings in a row. In wide feeds, a channel absent from its feed's row counts as missing |
-| feed_outage | No row from a feed for 5 periods |
+| noisy | An EWMA of squared sample-to-sample differences above 4 times its healthy level (level changes do not count as noise). It ends only after 30 samples in a row below the clear level, so noise at the threshold does not flap |
+| missing | 3 or more missing readings in a row. In wide feeds, a channel counts as missing when its feed keeps sending rows but the channel has had no value for longer than its limit. The limit is the largest of: 2 times its 99.9th percentile healthy gap, 10 periods, the NULL-rate rule, and 1.5 times its largest healthy gap (that last rule asks for at most 5 minutes) |
+| feed_outage | No row from a feed for longer than its limit: 1.5 times the largest healthy gap between rows in the calibration window, kept between 5 periods and 5 minutes. Real feeds pause for tens of seconds while healthy, and a fixed 5 periods (about 9 s for QT) would raise an outage about once an hour |
 | decoupled | CUSUM on the coupled channel's residual after removing gain times the source deviation (only for couplings given in the config) |
 
 Threshold calibration matters. With the plain Phase 5 thresholds (a 5 sigma CUSUM for every channel), healthy channels alarm constantly: an ARL of about 930 samples, plus far more on autocorrelated or wandering channels. By default (`adaptive=True`) every channel's thresholds come from its own healthy data:
@@ -692,6 +724,16 @@ Threshold calibration matters. With the plain Phase 5 thresholds (a 5 sigma CUSU
   - the Siegmund threshold for one false alarm per channel per 30 days;
   - 1.5 times the largest score seen on the healthy data.
 - **Noise and decoupling** thresholds are calibrated the same way.
+
+**Sigma for channels that hold values or are read out coarsely** (added after the first week of real data, 2025-11). On channels that repeat values, the MAD badly underestimates how much the channel normally moves:
+- LIT501 toggles between two readout codes 0.088 apart, and the MAD gave sigma 0.003, so every toggle was a "28.7 sigma spike" (467 in a week);
+- FC502 flow was constant for the whole calibration day, so sigma fell to 1e-6, and a 0.0036 change was "3617 sigma".
+
+Now:
+- **Channels that repeat values** (more than 20% of steps are zero) get the largest of three values: the MAD sigma, the central-98% spread in sigma units ((P99 - P1) / 4.653), and the median size of a non-zero update.
+- **A channel that was constant during calibration** gets 0.1% of its level (at least 1e-3).
+- **The noise reference** of both kinds is floored, so a burst of ordinary updates is not "noisy".
+- **Channels that do not repeat values** keep the plain MAD sigma.
 
 **Engine and state** (`monitor/engine.py`, `monitor/state.py`, `monitor/summary.py`). `Engine.from_healthy(healthy_events)` calibrates every channel, then `engine.step(t, values)` runs one event through the detectors, and `build_summary(engine.store)` gives the text the LLM sees:
 
@@ -740,17 +782,22 @@ All 200 runs, master seed 1:
 
 | Anomaly type | n | Detected (adaptive) | Rate | Incl. masked | Median delay s | Rate with plain Phase 5 thresholds |
 |---|---|---|---|---|---|---|
-| decoupling | 13 | 13 | 100% | 100% | -35 | 100% |
+| decoupling | 13 | 13 | 100% | 100% | -125 | 100% |
 | dropout | 20 | 17 | 85% | 90% | 2 | 85% |
-| exponential_drift | 22 | 20 | 91% | 100% | -182 | 95% |
-| linear_drift | 44 | 42 | 95% | 100% | 3 | 95% |
-| noise_growth | 16 | 16 | 100% | 100% | 479 | 100% |
+| exponential_drift | 22 | 20 | 91% | 100% | 103 | 95% |
+| linear_drift | 44 | 42 | 95% | 100% | 83 | 95% |
+| noise_growth | 16 | 16 | 100% | 100% | 540 | 100% |
 | spike | 51 | 30 | 59% | 69% | 0 | 71% |
 | spike_burst | 10 | 9 | 90% | 100% | 0 | 80% |
-| step_shift | 31 | 30 | 97% | 100% | 7 | 90% |
-| stuck_sensor | 30 | 30 | 100% | 100% | 52 | 100% |
-| transient_decay | 20 | 18 | 90% | 100% | 5 | 90% |
-| **False alarms per hour, clean runs** | | **0.049** | | | | **65.9** |
+| step_shift | 31 | 30 | 97% | 100% | 20 | 90% |
+| stuck_sensor | 30 | 30 | 100% | 100% | 56 | 100% |
+| transient_decay | 20 | 18 | 90% | 100% | 11 | 90% |
+| **False alarms per hour, clean runs** | | **0.021** | | | | **65.9** |
+
+These are the results with the real-data fixes of 2026-11-04 (the 1 sigma drift gate, settling, noise hysteresis and the held-value sigma):
+- **Detection rates:** unchanged for every type.
+- **False alarms:** 0.049 to 0.021 per hour on clean runs.
+- **The cost:** the drift gate waits until the recent mean deviation reaches 1 sigma, so drift alarms come later. The median delay grew from 3 to 83 s for linear drifts, -182 to 103 s for exponential drifts, and 7 to 20 s for steps. "first_detectable" is the time the effect passes 1 sigma, so most drift alarms now come just after it, not before. The plain column did not change, because the gate is part of the adaptive mode only.
 
 Delay is the alarm time minus `first_detectable`. A negative delay means the CUSUM fired before the effect passed 1 sigma.
 

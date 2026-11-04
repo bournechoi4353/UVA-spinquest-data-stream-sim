@@ -1,5 +1,7 @@
 """Detectors, state store, summary, live reader, and scoring."""
 
+import math
+import re
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -307,6 +309,186 @@ def test_engine_on_wide_feeds_detects_dropout_and_outage(tmp_path):
     kinds = {(c.subject, c.kind) for c in eng.raised}
     assert ("Labjack", "feed_outage") in kinds
     assert ("Flow_Rates.main_flow", "missing") in kinds
+
+
+def _feed_events(period, n, pauses=(), start=datetime(2026, 1, 1, tzinfo=timezone.utc), seed=0):
+    """One-channel QT-like feed: a row every ``period`` s, plus (index, extra seconds) pauses."""
+    rng = np.random.default_rng(seed)
+    extra = dict(pauses)
+    t, out = start, []
+    for i in range(n):
+        t = t + timedelta(seconds=period + extra.get(i, 0.0))
+        out.append((t, {"QT.pt501_ai": 5.0 + 0.01 * rng.standard_normal()}))
+    return out
+
+
+def test_feed_outage_limit_is_learned_from_healthy_pauses():
+    feeds = {"QT": ["QT.pt501_ai"]}
+    healthy = _feed_events(2.0, 3000, pauses=[(500, 28.0), (1700, 18.0)])      # largest healthy gap 30 s
+    eng = Engine.from_healthy(healthy, feeds=feeds)
+    assert eng.feed_watch["QT"].limit() == pytest.approx(45.0)                # 1.5 x 30 s
+    # a 30 s healthy pause later does not alarm; a 5 minute stop does
+    test = _feed_events(2.0, 600, pauses=[(100, 28.0), (400, 300.0)], start=healthy[-1][0], seed=1)
+    for t, ev in test:
+        eng.step(t, ev)
+    outages = [c for c in eng.raised if c.kind == "feed_outage"]
+    assert len(outages) == 1 and not outages[0].active
+
+
+def test_feed_outage_limit_is_clamped():
+    feeds = {"QT": ["QT.pt501_ai"]}
+    steady = Engine.from_healthy(_feed_events(2.0, 3000), feeds=feeds)
+    assert steady.feed_watch["QT"].limit() == pytest.approx(10.0, rel=0.05)   # never below 5 periods
+    with_outage = Engine.from_healthy(_feed_events(2.0, 3000, pauses=[(1000, 7200.0)]), feeds=feeds)
+    assert with_outage.feed_watch["QT"].limit() == pytest.approx(300.0)       # a real outage cannot raise it to hours
+
+
+def test_coverage_names_channels_without_calibration_data():
+    feeds = {"QT": ["QT.pt501_ai", "QT.pt502_ai"]}
+    healthy = _feed_events(2.0, 500)
+    healthy[3][1]["QT.pt502_ai"] = 1.0                                          # only 1 value
+    eng = Engine.from_healthy(healthy, feeds=feeds)
+    assert "QT.pt502_ai" not in eng.monitors
+    cov = dict(eng.coverage())
+    assert list(cov) == ["QT.pt502_ai"] and "1 values" in cov["QT.pt502_ai"]
+
+
+def test_run_monitor_writes_alarm_log_coverage_and_digest(stressed, tmp_path):
+    import json
+    import subprocess
+    from pathlib import Path
+    import sys
+    _, path, _ = stressed
+    root = Path(__file__).resolve().parent.parent
+    cmd = [sys.executable, str(root / "scripts/run_monitor.py"), "--sqlite", str(path), "--calibrate-minutes", "60",
+           "--out", str(tmp_path), "--name", "t"]
+    res = subprocess.run(cmd, capture_output=True, text=True, cwd=root)
+    assert res.returncode == 0, res.stderr
+    folder = tmp_path / "t"
+    rows = [json.loads(x) for x in (folder / "alarms.jsonl").read_text().splitlines()]
+    assert all({"subject", "kind", "since", "detected_at"} <= set(r) for r in rows)
+    cov = (folder / "coverage.txt").read_text()
+    assert "Monitored channels: 29" in cov and "Not monitored: 0" in cov and "Feed QT:" in cov
+    res = subprocess.run([sys.executable, str(root / "scripts/summarize_alarms.py"), str(folder),
+                          "--test-start", "2026-01-01T01:00:00", "--out", str(folder / "digest.txt")],
+                         capture_output=True, text=True, cwd=root)
+    assert res.returncode == 0, res.stderr
+    text = (folder / "digest.txt").read_text()
+    assert "== Coverage" in text and "== Window: test from 2026-01-01T01:00:00+00:00" in text
+
+
+# ---- real-data patterns seen on ptdb, 2025-11-04 to 11-10 -------------------------------------
+def _held(n, rng, levels=(0.0,), p_update=0.02, step=0.0):
+    """A held-value channel: mostly repeats, occasionally moves to another level or by +-step."""
+    v, x = [], levels[0]
+    for _ in range(n):
+        if rng.random() < p_update:
+            x = rng.choice(levels) if len(levels) > 1 else x + step * rng.choice([-1, 1])
+        v.append(x)
+    return np.array(v)
+
+
+def test_two_code_toggling_level_sensor_is_not_a_spike_storm():
+    # LIT501: toggles between two readout codes 0.088 apart, mostly on the lower one
+    rng = np.random.default_rng(0)
+    lo, hi = -0.0477, -0.0477 + 0.0877
+    vals = np.where(rng.random(40_000) < 0.03, hi, lo)
+    cal = calibrate(vals[:20_000], np.arange(20_000) * 2.0)
+    assert cal.sigma >= 0.0877 * 0.9 / 1.0 / 4.653          # at least the central-98% spread
+    adapt_thresholds(vals[:20_000], cal, DetectorSettings())
+    m = ChannelMonitor("lit", cal)
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    raised = [c for i, x in enumerate(vals[20_000:]) for c in m.update(t0 + timedelta(seconds=2 * i), float(x))]
+    assert sum(c.kind == "spike" for c in raised) == 0
+
+
+def test_channel_constant_in_calibration_does_not_give_thousand_sigma_alarms():
+    # FC502 flow: constant 0.112124 for the whole calibration day, later moves by 0.0036
+    cal = calibrate(np.full(5000, 0.112124), np.arange(5000) * 2.0)
+    assert cal.flat and cal.sigma == pytest.approx(1e-3)
+    adapt_thresholds(np.full(5000, 0.112124), cal, DetectorSettings())   # as Engine.from_healthy does
+    m = ChannelMonitor("fc502", cal)
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    raised = []
+    for i in range(3000):
+        x = 0.112124 - (0.00362 if 1000 <= i < 1003 else 0.0)
+        raised += m.update(t0 + timedelta(seconds=2 * i), x)
+    assert [c.kind for c in raised] == []                   # a 3.6 sigma blip is not a spike
+
+
+def test_drift_needs_one_sigma_and_clears_after_settling():
+    s = DetectorSettings()
+    rng = np.random.default_rng(1)
+    cal = calibrate(rng.normal(10, 1, 5000), np.arange(5000.0))
+    cal.cusum_h = 8.0
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # a persistent 0.6 sigma offset is above the CUSUM slack but must not be called abnormal
+    m = ChannelMonitor("ti505", cal, s)
+    raised = [c for i in range(20_000) for c in m.update(t0 + timedelta(seconds=i), 10.6 + rng.normal(0, 1))]
+    assert not any(c.kind.startswith("drift") for c in raised)
+    # a 3 sigma step is a drift; after the channel returns to 0.6 sigma it ends within about 30 min
+    m = ChannelMonitor("pt", cal, s)
+    seq = [13.0] * 3000 + [10.6] * 6000
+    raised = [c for i, x in enumerate(seq) for c in m.update(t0 + timedelta(seconds=i), x + rng.normal(0, 1))]
+    ups = [c for c in raised if c.kind == "drift_up"]
+    assert ups and not ups[0].active
+    assert (ups[0].ended_at - (t0 + timedelta(seconds=3000))).total_seconds() < 1800 + 300
+    assert len({id(c) for c in ups}) == 1                   # it does not come back while at 0.6 sigma
+
+
+def test_noise_alarm_does_not_flap_at_its_threshold():
+    rng = np.random.default_rng(2)
+    healthy = rng.normal(0, 1, 5000)
+    cal = calibrate(healthy, np.arange(5000.0))
+    adapt_thresholds(healthy, cal, DetectorSettings())
+    m = ChannelMonitor("fc501", cal)
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ratio = math.sqrt(m.noisy_level / cal.diff_var)
+    x = rng.normal(0, ratio * 1.02, 40_000)                 # noise hovering just above the threshold
+    raised = [c for i, v in enumerate(x) for c in m.update(t0 + timedelta(seconds=i), float(v))]
+    assert len({id(c) for c in raised if c.kind == "noisy"}) <= 3
+
+
+def test_missing_limit_covers_the_largest_healthy_gap():
+    # Labjack at local midnight: a 110 s gap once a day
+    t = np.cumsum(np.full(3000, 2.0))
+    t[1500:] += 110.0
+    cal = calibrate(np.random.default_rng(3).normal(0, 1, 3000), t)
+    assert cal.missing_after_s >= 1.5 * 112.0 - 1e-6
+    t[1500:] += 7200.0                                       # a 2 h writer absence cannot raise it past 7.5 min
+    cal = calibrate(np.random.default_rng(3).normal(0, 1, 3000), t)
+    assert cal.missing_after_s <= 450.0 + 1e-6
+
+
+def test_digest_counts_episodes_and_channels_that_alarm_together(tmp_path):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    folder = tmp_path / "run"
+    folder.mkdir()
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for k in range(3):                                      # three re-raises 10 min apart: one episode
+        s, e = t0 + timedelta(minutes=20 * k), t0 + timedelta(minutes=20 * k + 10)
+        rows.append({"subject": "QT.fc501_ai", "kind": "noisy", "since": s.isoformat(), "detected_at": s.isoformat(),
+                     "active": False, "ended_at": e.isoformat(), "magnitude": None, "magnitude_sigma": 6.4,
+                     "peak_sigma": None, "detail": {}})
+    for k in range(2):                                      # one writer: three flows missing together, twice
+        s = t0 + timedelta(hours=2 + k)
+        for ch in ("Flow_Rates.magnet_flow", "Flow_Rates.main_flow", "Flow_Rates.seperator_flow"):
+            rows.append({"subject": ch, "kind": "missing", "since": s.isoformat(), "detected_at": s.isoformat(),
+                         "active": False, "ended_at": (s + timedelta(minutes=5)).isoformat(), "magnitude": None,
+                         "magnitude_sigma": None, "peak_sigma": None, "detail": {}})
+    (folder / "alarms.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    (folder / "state.json").write_text(json.dumps({"now": (t0 + timedelta(hours=6)).isoformat(), "channels": {}}))
+    root = Path(__file__).resolve().parent.parent
+    res = subprocess.run([sys.executable, str(root / "scripts/summarize_alarms.py"), str(folder)],
+                         capture_output=True, text=True, cwd=root)
+    assert res.returncode == 0, res.stderr
+    assert re.search(r"noisy\s+3 raised \(\s*[\d.]+/h\)\s+1 episodes", res.stdout), res.stdout
+    assert "missing: Flow_Rates.magnet_flow + Flow_Rates.main_flow + Flow_Rates.seperator_flow: together 2 times" \
+        in res.stdout
 
 
 # ---- scoring -------------------------------------------------------------------------------

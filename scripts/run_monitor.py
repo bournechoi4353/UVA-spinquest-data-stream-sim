@@ -15,6 +15,10 @@ Output (default out/monitor/<name>/):
     state.json        the state store after the last event
     summary.txt       the summary after the last event
     snapshots.jsonl   {"time", "summary", "state"} every --every-minutes of stream time
+    alarms.jsonl      every condition raised (spikes too), with when it ended; one per line
+    coverage.txt      which channels are monitored, which are not and why, and each feed's outage limit
+
+Summarize alarms.jsonl with scripts/summarize_alarms.py.
 
 With --follow (sqlite or mysql) the monitor keeps polling every --poll-seconds and
 rewrites state.json and summary.txt after each poll. The Discord bot reads those files.
@@ -22,7 +26,7 @@ rewrites state.json and summary.txt after each poll. The Discord bot reads those
 Examples:
     python scripts/run_monitor.py --run out/mixed_demo --healthy configs/healthy.yaml
     python scripts/run_monitor.py --layout-run out/layout/seed1_mixed --calibrate-minutes 30
-    python scripts/run_monitor.py --mysql --since 2026-08-14T19:10:00 --until-hours 36 --calibrate-minutes 720
+    python scripts/run_monitor.py --mysql --since 2025-11-03T00:00:00 --until-hours 168 --calibrate-minutes 1440
 """
 
 from __future__ import annotations
@@ -71,6 +75,16 @@ def _split_calibration(events, minutes: float):
             return healthy, itertools.chain([(t, ev)], events)
         healthy.append((t, ev))
     return healthy, iter(())
+
+
+def coverage_text(engine: Engine) -> str:
+    """Monitored and unmonitored channels, and feed outage limits (for people, not the model)."""
+    missing = engine.coverage()
+    lines = [f"Monitored channels: {len(engine.monitors)}", f"Not monitored: {len(missing)}"]
+    lines += [f"  {k}: {why}" for k, why in missing]
+    for f, w in engine.feed_watch.items():
+        lines.append(f"Feed {f}: period {w.period_s:.3g} s, outage after {w.limit():.3g} s without a row")
+    return "\n".join(lines) + "\n"
 
 
 def main(argv=None) -> int:
@@ -148,6 +162,10 @@ def main(argv=None) -> int:
     def write_now():
         engine.store.save(out / "state.json")
         (out / "summary.txt").write_text(build_summary(engine.store) + "\n", encoding="utf-8")
+        with open(out / "alarms.jsonl", "w", encoding="utf-8") as fh:
+            for c in engine.raised:
+                fh.write(json.dumps(c.to_dict()) + "\n")
+        (out / "coverage.txt").write_text(coverage_text(engine), encoding="utf-8")
 
     def consume(evs):
         nonlocal next_snap
@@ -163,6 +181,8 @@ def main(argv=None) -> int:
     consume(rest)
     write_now()
     print(build_summary(engine.store))
+    print()
+    print(coverage_text(engine), end="")
     if args.follow and reader is not None:
         print(f"\nFollowing: polling every {args.poll_seconds:g} s (Ctrl+C to stop)")
         try:
