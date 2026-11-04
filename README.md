@@ -9,6 +9,8 @@ Everything in this repo runs on synthetic data. No real experiment data is store
 ## Contents
 
 1. [Status](#status)
+   - [Runbook: run everything on another computer](#runbook-run-everything-on-another-computer)
+   - [Project log](#project-log)
 2. [Setup](#setup)
 3. [Quick start](#quick-start)
 4. [Scripts](#scripts)
@@ -38,13 +40,212 @@ Everything in this repo runs on synthetic data. No real experiment data is store
 | 5 | Reference detectors and scoring (`monitor/`, `scripts/score_detectors.py`) | Done |
 | R1 | Real ptdb layout registry | Done |
 | R2 | Wide feeds, feed outages, SQLite fixture | Done |
-| R3 | Read-only, aggregates-only profiler | Done (not yet run on the real database) |
-| R4 | Fit the simulator to a profile, compare | Done (waiting for a real profile) |
+| R3 | Read-only, aggregates-only profiler | Done; run on the real database 2026-11-03 (Flow_Rates, Labjack, Lakeshore_Fridge_Temp); QT not yet |
+| R4 | Fit the simulator to a profile, compare | Done; fitted to the real profile (20 of 21 channels match) |
 | Pipeline | State store, summary builder, live reader, monitor | Done |
 | LLM | Q&A dataset, LoRA training, evaluation | Done: Qwen3.5-4B LoRA trained on Shannon, 100% on held-out phrasings (see [LLM training](#llm-training)) |
 | Bot | Discord bot | Done (not connected to Discord) |
 
-Tests: 242 passing (`pytest`).
+Tests: 245 passing (`pytest`).
+
+## Runbook: run everything on another computer
+
+This section is a complete, ordered checklist. It covers getting the code, the tests, the simulated data, the detector benchmark, the read-only profile of the real database, the Q&A dataset, the LoRA fine-tune, every evaluation, the real-data test, live monitoring, and the Discord bot. Every number in "Expected result" was measured on the runs listed in [Project log](#project-log). The sections after this one explain each piece in detail.
+
+### R.0 What you need
+
+| Need | For | Used so far |
+|---|---|---|
+| Python 3.11+ | everything | 3.14 (Windows laptop), 3.12.3 (`/usr/bin/python3` on Shannon) |
+| Linux + NVIDIA GPU, 48 GB for the default batch size | training and model answers | RTX A6000 48 GB, driver 590.48.01, peak about 41 GB at batch 16 |
+| About 25 GB of disk | training env (7.2 GB), model cache (12 GB), pip cache (5.7 GB) | `~/spinquest-discord-anomaly-checker` on Shannon |
+| Network access to `twist.phys.virginia.edu:3306` | profiler, real-data test, live monitor | Shannon can reach it (use the full name: plain `twist` does not resolve there) |
+| A read-only-capable ptdb account | same | `uvaspin`; the password is typed in by you and never stored |
+
+Steps R.1 to R.4 run on any computer, Windows included. Steps R.5 to R.10 need the database or the GPU, so run them on a Linux machine like Shannon. Training was tested only on Linux. flash-linear-attention uses Triton, which does not support Windows.
+
+**Rules that hold on every machine:**
+- **Environments:** work in a new folder with new virtual environments. Never install into the system Python, conda, or anyone's existing environment.
+- **Caches:** set `HF_HOME`, `PIP_CACHE_DIR` and `TRITON_CACHE_DIR` to folders inside the project. The `scripts/shannon_*.sh` helpers do this.
+- **Database:** read-only, and only by a person who types in the password. Never write a password to a file, a script or the shell history.
+- **GPU sharing:** on a shared GPU machine, check `nvidia-smi` before starting a GPU job.
+- **Outputs:** never commit anything under `out/`, and review profile and monitor outputs before sharing them.
+
+### R.1 Get the code
+
+    git clone https://github.com/bournechoi4353/UVA-spinquest-data-stream-sim.git ~/spinquest-discord-anomaly-checker
+    cd ~/spinquest-discord-anomaly-checker
+
+Commit and push your work first: a clone contains only what is committed. To copy to a machine without git access, make a tarball from the repo folder:
+
+    tar --exclude=.venv* --exclude=out --exclude=.git --exclude=.hf-home --exclude=.pip-cache -czf ../anomaly_checker.tar.gz .
+    scp ../anomaly_checker.tar.gz user@host:
+    ssh user@host 'mkdir -p ~/spinquest-discord-anomaly-checker && tar -xzf ~/anomaly_checker.tar.gz -C ~/spinquest-discord-anomaly-checker'
+
+Files that are not in git (all under `out/`, gitignored) and whether you need them:
+
+| File | Needed for | How to get it |
+|---|---|---|
+| `out/model/adapter/` (144 MB) | model answers and the bot, without retraining | `scp -r uvaspin@shannon.phys.virginia.edu:spinquest-discord-anomaly-checker/out/model/adapter out/model/`, or retrain (R.7) |
+| `out/profile/ptdb_profile.json` | fitting the simulator to the real data (R.4, end-to-end test) | copy it from Shannon the same way, or re-profile (R.5). Without it, the end-to-end test uses unfitted defaults and says so in its report |
+| `out/batch/`, `out/qa/` | dataset and training | regenerate (R.3, R.6) |
+
+### R.2 Base environment and tests
+
+    python3 -m venv .venv
+    .venv/bin/pip install -r requirements.txt          # Windows: .venv/Scripts/python -m pip install -r requirements.txt
+    .venv/bin/python -m pytest -q
+
+Expected result: `245 passed`, in about 75 s.
+
+### R.3 Simulated data and the detector benchmark
+
+    .venv/bin/python scripts/make_batch.py --n 200 --master-seed 1          # out/batch/, about 30 s, 250 MB
+    .venv/bin/python scripts/score_detectors.py out/batch --split all        # adaptive thresholds
+    .venv/bin/python scripts/score_detectors.py out/batch --split all --plain
+
+Expected result: 0.049 false alarms per hour on clean runs with adaptive thresholds (65.9 with `--plain`). The per-type rates are in [Detector results](#detector-results-phase-5).
+
+### R.4 The real layout, wide feeds and the fit to the profile
+
+    .venv/bin/python scripts/show_registry.py                    # 29 channels: Flow_Rates 5, Labjack 8, QT 16
+    .venv/bin/python scripts/make_layout_scenario.py --hours 6 --seed 1 --anomalies mixed --fixture --plot
+    .venv/bin/python scripts/run_monitor.py --sqlite out/layout/seed1_mixed/fixture.sqlite --calibrate-minutes 60
+    .venv/bin/python scripts/compare_sim_to_profile.py out/profile/ptdb_profile.json    # needs the profile
+    .venv/bin/python scripts/run_end_to_end.py --hours 12 --seed 2026                   # template answerer
+
+Expected end-to-end result per seed: 7 of 7 planted anomalies found, 0 to 2 false alarms, and 83 to 91% of template answers passing. The report is `out/e2e/report.md`.
+
+### R.5 Profile the real database (you, by hand, read-only)
+
+    cd ~/spinquest-discord-anomaly-checker
+    bash scripts/shannon_profile.sh                                   # Flow_Rates, Labjack, Lakeshore_Fridge_Temp (done 2026-11-03)
+    TABLES=QT OUT=out/profile_qt bash scripts/shannon_profile.sh      # QT only (not done yet; R.9 also does it)
+
+The script does four things in order:
+1. Builds `.venv-profile` (172 MB, only the profiler's packages).
+2. Asks for the host (`twist.phys.virginia.edu`), the port (`3306`), the user and the password. The password is not shown or stored.
+3. Prints the dry run and waits for your yes.
+4. Runs at low CPU and IO priority, with a 0.5 s pause after each query.
+
+The profile of 3 tables was 900 read-only statements. Read `out/profile/ptdb_profile.md` before sharing it.
+
+### R.6 Build the Q&A dataset
+
+    .venv/bin/python -m training.make_dataset --batch out/batch --layout-runs 120 --out out/qa
+
+This needs `out/batch` from R.3. It runs the real detectors over the 200 batch runs and over 120 new wide-feed runs with the names in `configs/ptdb_layout.yaml`, then writes `train`, `val`, `test` and `test_holdout` (new phrasings) as JSONL.
+- **Expected size:** about 6,300 / 800 / 800 / 800 examples, about 11 MB.
+- **`out/qa` vs `out/qa_v2`:** the adapter was trained on `out/qa`, which was built before the QT display names were added. `out/qa_v2` is the same command with `--out out/qa_v2`, run after the renaming (6,349 / 804 / 768 / 794), and it is used only for testing. A new build uses the current names.
+
+The dataset needs no GPU. The template baseline:
+
+    .venv/bin/python -m training.evaluate --data out/qa --split test_holdout --answerer template
+
+Expected result: about 85% pass on `test_holdout`, 100% on `test`.
+
+### R.7 Fine-tune Qwen3.5-4B (GPU machine)
+
+    cd ~/spinquest-discord-anomaly-checker
+    /usr/bin/python3 -m venv .venv-train                      # a NEW env from the system interpreter, not conda
+    export PIP_CACHE_DIR=$PWD/.pip-cache HF_HOME=$PWD/.hf-home TRITON_CACHE_DIR=$PWD/.triton-cache
+    unset PYTHONPATH
+    .venv-train/bin/pip install -r requirements.txt -r requirements-train.txt
+    #   or exactly the set that was used:  .venv-train/bin/pip install -r requirements-train.lock.txt -r requirements.txt
+    nvidia-smi                                                # make sure nobody else is using the GPU
+    mkdir -p out/logs
+    EPOCHS=1 setsid nohup bash scripts/shannon_train.sh > out/logs/full_run.log 2>&1 < /dev/null &
+    tail -f out/logs/full_run.log                             # Ctrl+C stops watching, not the run
+
+The exact package versions used are in `requirements-train.lock.txt`: torch 2.15.0 with the CUDA 13.2 runtime, transformers 5.22.1, peft 0.21.2, accelerate 1.15.0 and flash-linear-attention 0.6.0. The first run downloads Qwen/Qwen3.5-4B (about 9 GB) into `.hf-home`.
+
+`scripts/shannon_train.sh` trains, then evaluates the template, the base model and the fine-tuned adapter on `test` and `test_holdout`.
+- **Outputs:** `out/model/adapter/`, `out/eval/*.jsonl` and `out/eval/summary.txt`; it ends with `RUN_DONE`.
+- **Run time on the A6000:** 68 min of training (393 steps at about 10 s per step), plus 16 min of evaluation.
+- **Expected result:** validation loss about 0.003, and 100% pass with 0% hallucinated for the fine-tuned model on both splits.
+- **Smaller GPU:** run the training command by hand with `--batch-size 4 --grad-accum 4`. The effective batch is the same, it runs slower, and this setting was not tested.
+- **Stop it:** `pkill -f "[t]raining.train_lora"; pkill -f "[t]raining.evaluate"`.
+
+### R.8 Post-training checks (GPU machine)
+
+    setsid nohup bash scripts/shannon_post_eval.sh > out/logs/post_eval.log 2>&1 < /dev/null &
+
+This needs `out/qa_v2` (R.6 with `--out out/qa_v2`). It runs the end-to-end test with the fine-tuned model answering (seeds 2026 and 99), and the QT-name held-out set.
+- **Outputs:** `out/e2e_model_s2026/report.md`, `out/e2e_model_s99/report.md` and `out/eval/summary_v2.txt`; it ends with `POST_DONE` after about 25 minutes.
+- **Expected result:** 7 of 7 planted anomalies per seed, 0 or 1 false alarm, 100% of answers passing, and 100% on the QT-name set.
+
+### R.9 The full test on real data (you, by hand, read-only)
+
+    cd ~/spinquest-discord-anomaly-checker
+    bash scripts/shannon_realtest.sh
+
+This needs `.venv-profile` (R.5) and, for step 4, `.venv-train` and `out/model/adapter`. It asks for the password once. Settings are environment variables:
+- `SINCE` (UTC start, default `2026-08-14T19:10:00`, the start of the latest logger run);
+- `CAL_HOURS` (default 12);
+- `TEST_HOURS` (default 24);
+- `PAUSE` (default 0.5 s).
+
+| Step | What | Estimated time |
+|---|---|---|
+| 1 | Profile QT, aggregates only, about 300 statements | 5 to 15 min |
+| 2 | Set QT's `nominal_period_s` in `configs/ptdb_layout.yaml` from the profile | seconds |
+| 3 | Monitor: find the start row by binary search on `id` (about 25 primary-key lookups per table), read 36 h of Flow_Rates, Labjack and QT (about 350k rows, pages of 5,000), calibrate on 12 h, monitor 24 h | 5 to 15 min |
+| 4 | Five questions to the fine-tuned model (each loads the model, about 1 min) | about 5 min |
+
+Total: about 20 to 40 minutes. The outputs are `out/profile_qt/ptdb_profile.md`, `out/monitor/real/summary.txt`, `snapshots.jsonl` and `answers.txt`. Review them before sharing. Every statement passes the read-only guard, and the session is `READ ONLY` with a 30 s timeout per query. A timeout cancels that query and leaves the database untouched.
+
+What to look at:
+- **Alarms in the 24 h:** each one is either a real event (ask Jay) or a false alarm, such as a mode change or a held value.
+- **The QT period:** check the measured value in the profile.
+
+### R.10 Live monitoring and the Discord bot (GPU machine)
+
+Live monitor: it backfills from `--since`, calibrates on the first 12 h, then keeps polling every 30 s and rewrites `summary.txt`:
+
+    export PTDB_HOST=twist.phys.virginia.edu PTDB_PORT=3306 PTDB_USER=uvaspin PTDB_DATABASE=ptdb
+    read -r -s -p "Password: " PTDB_PASSWORD; echo; export PTDB_PASSWORD
+    SINCE=$(date -u -d '-12 hours' +%Y-%m-%dT%H:%M:%S)
+    .venv-profile/bin/python scripts/run_monitor.py --mysql --since "$SINCE" --calibrate-minutes 720 \
+        --follow --poll-seconds 30 --every-minutes 30 --name live
+
+The bot, in a second terminal:
+
+    .venv-train/bin/pip install -r requirements-bot.txt
+    read -r -s -p "Discord token: " DISCORD_BOT_TOKEN; echo; export DISCORD_BOT_TOKEN
+    export HF_HOME=$PWD/.hf-home TRITON_CACHE_DIR=$PWD/.triton-cache
+    .venv-train/bin/python -m bot.discord_bot --monitor-dir out/monitor/live --adapter out/model/adapter
+
+Test it offline first:
+
+    .venv-train/bin/python -m bot.discord_bot --monitor-dir out/monitor/live --adapter out/model/adapter --ask "anything wrong?"
+
+Discord setup: create an application and bot in the Discord developer portal, enable the **Message Content** intent, and invite the bot to your server. Then mention it, or use `!ask <question>` or `!status`.
+
+Calibration caveat: the monitor treats the first 12 h as healthy. Start it from a stretch you know was normal. Until operating modes are handled, a mode change will show up as a drift (see [Known limits](#known-limits)).
+
+### R.11 Cleanup
+
+- **Delete when done:** `.pip-cache` (safe to delete). `.hf-home` holds the base model: deleting it means downloading again.
+- **Stop the jobs:** `pkill -f "[r]un_monitor"`, `pkill -f "[b]ot.discord_bot"`.
+- **On Shannon:** one leftover from the first training run sits outside the folder, `~/.triton` (75 MB, ours). Remove it with `rm -rf ~/.triton`. The scripts now keep this cache inside the folder.
+
+## Project log
+
+What was done, in order, with what was decided and why.
+
+| Date | What | Result or decision |
+|---|---|---|
+| before 2026-11-03 | Phases 1 and 2 (simulator, batch generation) | Committed on another computer |
+| 2026-11-03 | Phases 3, 4 and 5: plots, this README, reference detectors and scoring | Adaptive per-channel thresholds: 0.049 false alarms/h vs 65.9/h with fixed thresholds |
+| 2026-11-03 | R1 to R4: real layout (11 tables, 109 columns), wide feeds and SQLite fixture, read-only profiler, fit to a profile | All read-only through one guard; aggregates only |
+| 2026-11-03 | First real profile (Flow_Rates, Labjack, Lakeshore_Fridge_Temp), run by you on Shannon, read-only | MariaDB 10.3.39; logger down about 248 of 368 days; 40 to 64% NULL partial rows; 2% late rows; Fridge all zeros; root_exhaust_pressure held at -41030.7 (see [What the real profile showed](#what-the-real-profile-showed-2026-11-03)) |
+| 2026-11-03 | Mentor (Jay): -41030.7 is not a known error code; the Fridge sensors are not connected yet; start with QT | Lakeshore_Fridge_Temp excluded; QT included (16 channels, names from instrument tags); held-value channels get `stuck_normal` |
+| 2026-11-03 | Pipeline: state store, summary, live reader, monitor, end-to-end test on realistic simulated data | 35 of 35 planted anomalies over 5 seeds; three bugs found and fixed (a spike hidden by a NULL, the missing timer during outages, a missing limit that ignored the NULL rate) |
+| 2026-11-03 | Model choice | Qwen/Qwen3.5-4B (your choice; not GLM, not Qwen2.5), text only, thinking off. flash-linear-attention cut a step from 38 s to about 10 s |
+| 2026-11-03 22:33 to 23:57 | Training plus evaluation on Shannon (A6000), in `.venv-train` inside the project folder | 1 epoch, validation loss 0.0029; 100% on `test` and `test_holdout` |
+| 2026-11-04 00:34 to 00:57 | Post-training checks | End to end with the model: 14 of 14 detected, 1 false alarm, 244 of 244 answers; QT-name set 100% |
+| 2026-11-04 | Live reader fix | `start_at_time` used `WHERE Timestamp >= ...`, which could scan millions of rows on an unindexed column and hit the 30 s timeout. It now binary-searches on the primary key (20 to 25 lookups per table). It is tested against a brute-force search, with id gaps, outages and late rows |
+| next | Real-data test (R.9), the operating-modes question for Jay, Discord setup (R.10) | Waiting on you |
 
 ## Setup
 
@@ -512,6 +713,7 @@ It goes through the same adapters and guard as the profiler.
 - **NULLs:** left out of the event.
 - **Backfill:** reads the table that is furthest behind first, so feeds with different row rates interleave correctly.
 - **Live use:** `poll()` reads new rows; `start_at_time()` and `start_at_end()` set the watermarks.
+- **Finding a start time without a scan:** `start_at_time()` binary-searches on the primary key (`WHERE id >= :mid ORDER BY id LIMIT 1`, about 25 lookups for 14 million rows). It never filters on the time column, which may have no index. Late rows are seconds late, so the start found is correct to within the reorder window.
 
 **Running it** (`scripts/run_monitor.py`):
 

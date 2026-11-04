@@ -67,16 +67,50 @@ class PtdbReader:
 
     # ---- watermarks ------------------------------------------------------------------
     def start_at_time(self, when: datetime) -> None:
-        """Set each table's watermark to just before the first row at or after ``when``."""
-        text = when.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        """Set each table's watermark to just before the first row at or after ``when``.
+
+        The time column may have no index, so a ``WHERE time >= ...`` query could scan
+        millions of rows and hit the per-query timeout. Instead this binary-searches on
+        the primary key: each probe is ``WHERE id >= :mid ORDER BY id LIMIT 1``, about
+        25 probes per table for 14 million rows. Rows are close to time order by id (late
+        rows are seconds late), so the start found is correct to within the reorder window.
+        """
+        when_us = int(round(when.astimezone(UTC).timestamp() * 1e6))
         for t in self.tables:
-            rows = self.a.execute(f"SELECT MIN(id) FROM {self.a.quote(t.name)} "
-                                  f"WHERE {self.a.quote(t.time_column)} >= {self.a.param}", (text,))
-            first = rows[0][0] if rows and rows[0][0] is not None else None
-            if first is None:
-                rows = self.a.execute(f"SELECT MAX(id) FROM {self.a.quote(t.name)}")
-                first = (rows[0][0] or 0) + 1
-            self.stats.last_id[t.name] = int(first) - 1
+            self.stats.last_id[t.name] = self._first_id_at(t, when_us) - 1
+
+    def _probe(self, t: Table, at_id: int) -> tuple[int, int | None] | None:
+        """The first row with id >= ``at_id``: (id, time in UTC microseconds), or None."""
+        a = self.a
+        idc = a.quote(t.id_column)
+        rows = a.execute(f"SELECT {idc}, {a.quote(t.time_column)} FROM {a.quote(t.name)} "
+                         f"WHERE {idc} >= {a.param} ORDER BY {idc} LIMIT 1", (int(at_id),))
+        if not rows:
+            return None
+        return int(rows[0][0]), a.to_us(rows[0][1])
+
+    def _first_id_at(self, t: Table, when_us: int) -> int:
+        """Smallest id whose row time is >= ``when_us`` (max id + 1 if there is none)."""
+        a = self.a
+        idc = a.quote(t.id_column)
+        rows = a.execute(f"SELECT MIN({idc}), MAX({idc}) FROM {a.quote(t.name)}")
+        lo_id, hi_id = (rows[0] if rows else (None, None))
+        if lo_id is None:
+            return 1
+        lo, hi = int(lo_id), int(hi_id) + 1          # answer in [lo, hi]; hi means "no such row"
+
+        def at_or_after(mid: int) -> bool:
+            row = self._probe(t, mid)
+            return row is None or (row[1] is not None and row[1] >= when_us)
+
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if at_or_after(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        row = self._probe(t, lo) if lo <= int(hi_id) else None
+        return row[0] if row else int(hi_id) + 1
 
     def start_at_end(self) -> None:
         """Only new rows from now on."""

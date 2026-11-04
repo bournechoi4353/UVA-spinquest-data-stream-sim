@@ -205,6 +205,87 @@ def test_reader_polls_incrementally(stressed):
     assert r2.poll(flush=True) == []
 
 
+def _brute_first_id(path, table, when):
+    import sqlite3
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute(f'SELECT id, "Timestamp" FROM "{table}" ORDER BY id').fetchall()
+    finally:
+        con.close()
+    for rid, ts in rows:
+        if datetime.fromisoformat(ts).replace(tzinfo=timezone.utc) >= when:
+            return rid
+    return rows[-1][0] + 1 if rows else 1
+
+
+def _qt_db(path, rows):
+    """A minimal QT table: (id, 'YYYY-MM-DD HH:MM:SS') rows, ids may have gaps."""
+    import sqlite3
+    con = sqlite3.connect(path)
+    con.execute('CREATE TABLE "QT" (id INTEGER PRIMARY KEY, "Timestamp" TEXT NOT NULL)')
+    con.executemany('INSERT INTO "QT" (id, "Timestamp") VALUES (?, ?)', rows)
+    con.commit()
+    con.close()
+
+
+@pytest.fixture(scope="module")
+def clean_with_outage(tmp_path_factory):
+    from sim.layout_recipes import mixed_anomalies
+    raw = {"seed": 8, "start_time": "2026-01-01T00:00:00", "duration_seconds": 2 * 3600}
+    raw["anomalies"] = [a for a in mixed_anomalies(raw, REG) if a.get("type") == "feed_outage"]
+    run = generate_layout(raw, REG)
+    path = tmp_path_factory.mktemp("bs") / "f.sqlite"
+    write_fixture(run, path)
+    return path
+
+
+def test_start_at_time_matches_brute_force_without_a_time_query(clean_with_outage):
+    path = clean_with_outage
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    whens = [base - timedelta(hours=1), base, base + timedelta(seconds=1), base + timedelta(minutes=37, seconds=13),
+             base + timedelta(minutes=61), base + timedelta(hours=1, minutes=59, seconds=59),
+             base + timedelta(hours=5)]
+    whens += [base + timedelta(seconds=int(s)) for s in np.random.default_rng(3).integers(0, 7200, 25)]
+    for when in whens:
+        a = SQLiteAdapter(path)
+        r = PtdbReader(a, REG)
+        r.start_at_time(when)
+        for t in r.tables:
+            assert r.stats.last_id[t.name] + 1 == _brute_first_id(path, t.name, when), (t.name, when)
+        # every statement is a primary-key probe or MIN/MAX(id): none filters on the time column
+        assert all("Timestamp\" >=" not in s and "Timestamp >=" not in s for s in a.statements)
+        assert len(a.statements) <= len(r.tables) * 30
+
+
+def test_start_at_time_handles_id_gaps_and_the_edges(tmp_path):
+    path = tmp_path / "gaps.sqlite"
+    base = datetime(2026, 8, 14, 19, 0, tzinfo=timezone.utc)
+    ids = [5, 6, 7, 40, 41, 900, 901, 902, 10_000, 10_001]
+    _qt_db(path, [(i, (base + timedelta(seconds=10 * k)).strftime("%Y-%m-%d %H:%M:%S")) for k, i in enumerate(ids)])
+    for k in range(-1, len(ids) + 1):
+        when = base + timedelta(seconds=10 * k - 3)
+        r = PtdbReader(SQLiteAdapter(path), REG, tables=["QT"])
+        r.start_at_time(when)
+        expect = ids[max(k, 0)] if k < len(ids) else ids[-1] + 1
+        assert r.stats.last_id["QT"] + 1 == expect, (k, when)
+    empty = tmp_path / "empty.sqlite"
+    _qt_db(empty, [])
+    r = PtdbReader(SQLiteAdapter(empty), REG, tables=["QT"])
+    r.start_at_time(base)
+    assert r.stats.last_id["QT"] == 0
+
+
+def test_start_at_time_with_late_rows_starts_within_the_reorder_window(stressed):
+    _, path, _ = stressed
+    when = datetime(2026, 1, 1, 1, 30, tzinfo=timezone.utc)
+    r = PtdbReader(SQLiteAdapter(path), REG)
+    r.start_at_time(when)
+    events = list(r.read_all())
+    assert events
+    assert events[0][0] >= when - timedelta(seconds=60)
+    assert events[0][0] <= when + timedelta(seconds=60)
+
+
 def test_reader_only_issues_guarded_selects(stressed):
     _, path, _ = stressed
     a = SQLiteAdapter(path)
