@@ -1,0 +1,233 @@
+# Layout of the real ptdb MySQL database (Phase R1).
+# Source: section 3 of real-data-alignment-prompt.md. Column names keep their real spelling,
+# including the typos seperator and buffle. Every unit is null until confirmed (section 3.4).
+# Groups are inferred from column and table names (group_inferred: true). For QT the group
+# comes from the instrument tag prefix (ti temperature, pt pressure, fc flow), which is a guess.
+# nominal_period_s values are averages from row counts and assume the logger never paused.
+# They will be replaced by measured spacing from the profiler (Phase R4).
+#
+# Open items (section 3, not yet filled in):
+# Measured by the read-only profiler (2026-11-03, aggregates only):
+# - server 10.3.39-MariaDB, @@system_time_zone EDT (so datetime columns are taken as America/New_York)
+# - the logger was down for about 248 of 368 days (longest gap 2026-03-03 to 2026-08-13)
+# - nominal_period_s below is the measured mean spacing while the logger runs
+# - many NULLs (Flow_Rates 40 to 64 percent, Labjack 53 percent) and 19 to 40 percent shared timestamps:
+#   rows look like partial rows from more than one writer in the same second
+# - every Lakeshore_Fridge_Temp channel read exactly 0 in all samples: the mentor confirmed the
+#   sensors are not connected yet, so that feed is deferred. QT is included instead (its sensors
+#   are finalized); its period is provisional until QT is profiled.
+# - TODO: SHOW CREATE TABLE for tables other than Labjack, Flow_Rates, Lakeshore_Fridge_Temp
+#   (assumed here: same id primary key and Timestamp index)
+# - TODO: sentinel value convention for failed reads (root_exhaust_pressure has a median of -41030.7,
+#   which looks like one)
+# - TODO: row counts and time ranges for the deferred and excluded tables
+# - TODO: whether the logger is still writing after 2026-08-17
+
+version: 1
+database: ptdb
+tables:
+  - name: Flow_Rates
+    id_column: id
+    time_column: Timestamp
+    time_type: timestamp
+    time_zone: UTC  # MySQL timestamp is stored in UTC, read with session time_zone +00:00
+    time_zone_assumed: false
+    timestamp_resolution_s: 1
+    include: true
+    nominal_period_s: 1.354  # measured mean spacing while running (row-count average was 2.28)
+    channels:
+      - {db_column: seperator_flow, display_name: "Separator flow", unit: null, group: flow, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: magnet_flow, display_name: "Magnet flow", unit: null, group: flow, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: main_flow, display_name: "Main flow", unit: null, group: flow, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: microwave_flow, display_name: "Microwave flow", unit: null, group: flow, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: heat_exchanger_flow, display_name: "Heat exchanger flow", unit: null, group: flow, group_inferred: true, role: sensor, registry_status: named}
+  - name: IVC
+    id_column: id
+    time_column: Timestamp
+    time_type: timestamp
+    time_zone: UTC  # MySQL timestamp is stored in UTC, read with session time_zone +00:00
+    time_zone_assumed: false
+    timestamp_resolution_s: null
+    include: false
+    reason: "Deferred: contents of IVC unknown (section 3.4)."
+    nominal_period_s: null
+    channels:
+      - {db_column: ivc_pressure, display_name: "IVC pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: named}
+  - name: Labjack
+    id_column: id
+    time_column: Timestamp
+    time_type: timestamp
+    time_zone: UTC  # MySQL timestamp is stored in UTC, read with session time_zone +00:00
+    time_zone_assumed: false
+    timestamp_resolution_s: 1
+    include: true
+    nominal_period_s: 1.105  # measured mean spacing while running (row-count average was 1.79)
+    channels:
+      - {db_column: root_exhaust_pressure, display_name: "Root exhaust pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: median -41030.7, likely a sentinel or error value most of the time."}
+      - {db_column: buffer_pressure, display_name: "Buffer pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: magnet_pressure, display_name: "Magnet pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: purifier_inlet_pressure, display_name: "Purifier inlet pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: fridge_vapor_pressure, display_name: "Fridge vapor pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: held at one value for long runs (repeat share 1.0)."}
+      - {db_column: thermocouple, display_name: "Thermocouple", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: magnet_bottom_temperature, display_name: "Magnet bottom temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: magnet_top_temperature, display_name: "Magnet top temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+  - name: Lakeshore_Fridge_Temp
+    id_column: id
+    time_column: Timestamp
+    time_type: timestamp
+    time_zone: UTC  # MySQL timestamp is stored in UTC, read with session time_zone +00:00
+    time_zone_assumed: false
+    timestamp_resolution_s: 1
+    include: false
+    reason: "Deferred: sensors not connected yet (mentor, 2026-11-03); every value read 0 in the profile."
+    nominal_period_s: 1.879  # measured mean spacing while running (row-count average was 3.57)
+    channels:
+      - {db_column: fridge_target_top_up_temperature, display_name: "Fridge target top up temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: exactly 0 in every sample (not connected?)."}
+      - {db_column: fridge_target_top_up_center_temperature, display_name: "Fridge target top up center temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: exactly 0 in every sample (not connected?)."}
+      - {db_column: fridge_target_top_down_temperature, display_name: "Fridge target top down temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: exactly 0 in every sample (not connected?)."}
+      - {db_column: fridge_target_bottom_up_temperature, display_name: "Fridge target bottom up temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: exactly 0 in every sample (not connected?)."}
+      - {db_column: fridge_target_bottom_up_center_temperature, display_name: "Fridge target bottom up center temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: exactly 0 in every sample (not connected?)."}
+      - {db_column: fridge_target_bottom_down_temperature, display_name: "Fridge target bottom down temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: exactly 0 in every sample (not connected?)."}
+      - {db_column: fridge_target_top_cernox_temperature, display_name: "Fridge target top cernox temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: exactly 0 in every sample (not connected?)."}
+      - {db_column: fridge_target_bottom_cernox_temperature, display_name: "Fridge target bottom cernox temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named, notes: "Profile: exactly 0 in every sample (not connected?)."}
+  - name: Lakeshore_Magnet_Temp
+    id_column: id
+    time_column: Timestamp
+    time_type: timestamp
+    time_zone: UTC  # MySQL timestamp is stored in UTC, read with session time_zone +00:00
+    time_zone_assumed: false
+    timestamp_resolution_s: null
+    include: false
+    reason: "Deferred: all 8 channels are unnamed (section 3.4)."
+    nominal_period_s: null
+    channels:
+      - {db_column: magnet_channel_1, display_name: "Magnet channel 1", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: magnet_channel_2, display_name: "Magnet channel 2", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: magnet_channel_3, display_name: "Magnet channel 3", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: magnet_channel_4, display_name: "Magnet channel 4", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: magnet_channel_5, display_name: "Magnet channel 5", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: magnet_channel_6, display_name: "Magnet channel 6", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: magnet_channel_7, display_name: "Magnet channel 7", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: magnet_channel_8, display_name: "Magnet channel 8", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+  - name: Lakeshore_Target_Stick
+    id_column: id
+    time_column: Timestamp
+    time_type: timestamp
+    time_zone: UTC  # MySQL timestamp is stored in UTC, read with session time_zone +00:00
+    time_zone_assumed: false
+    timestamp_resolution_s: null
+    include: false
+    reason: "Deferred: not in the first version (section 3.3)."
+    nominal_period_s: null
+    channels:
+      - {db_column: target_stick_buffle_top_temperature, display_name: "Target stick buffle top temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: inferred, notes: "TODO: confirm whether buffle means baffle (section 3.4)."}
+      - {db_column: target_stick_buffle_bottom_temperature, display_name: "Target stick buffle bottom temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: inferred, notes: "TODO: confirm whether buffle means baffle (section 3.4)."}
+      - {db_column: target_stick_seperator_top_temperature, display_name: "Target stick separator top temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: target_stick_seperator_bottom_temperature, display_name: "Target stick separator bottom temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: target_stick_heat_exchanger_top_temperature, display_name: "Target stick heat exchanger top temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: target_stick_heat_exchanger_bottom_temperature, display_name: "Target stick heat exchanger bottom temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: target_stick_annealing_plate_bar_temperature, display_name: "Target stick annealing plate bar temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: target_stick_annealing_plate_top_temperature, display_name: "Target stick annealing plate top temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+  - name: MaxiGauge
+    id_column: id
+    time_column: Timestamp
+    time_type: timestamp
+    time_zone: UTC  # MySQL timestamp is stored in UTC, read with session time_zone +00:00
+    time_zone_assumed: false
+    timestamp_resolution_s: null
+    include: false
+    reason: "Deferred: channels 3 to 6 are unnamed (section 3.4)."
+    nominal_period_s: null
+    channels:
+      - {db_column: maxigauge_seperator_inlet_pressure, display_name: "Maxigauge separator inlet pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: maxigauge_upper_roots_pressure, display_name: "Maxigauge upper roots pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: maxigauge_channel_3, display_name: "Maxigauge channel 3", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: maxigauge_channel_4, display_name: "Maxigauge channel 4", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: maxigauge_channel_5, display_name: "Maxigauge channel 5", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: maxigauge_channel_6, display_name: "Maxigauge channel 6", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+  - name: NMR
+    id_column: id
+    time_column: Timestamp
+    time_type: timestamp
+    time_zone: UTC  # MySQL timestamp is stored in UTC, read with session time_zone +00:00
+    time_zone_assumed: false
+    timestamp_resolution_s: null
+    include: false
+    reason: "Deferred: table is empty and the polarization source is unknown (section 3.4)."
+    nominal_period_s: null
+    channels:
+      - {db_column: run_number, display_name: "Run number", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named, sql_type: int}
+      - {db_column: measurement_type, display_name: "Measurement type", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named, sql_type: text}
+      - {db_column: peak_amp, display_name: "Peak amp", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: peak_center, display_name: "Peak center", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: beam_on, display_name: "Beam on", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named, sql_type: int}
+      - {db_column: rf_level, display_name: "RF level", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: if_atten, display_name: "IF atten", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: he_temperature, display_name: "He temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: he_pressure, display_name: "He pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: nmr_channel, display_name: "NMR channel", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named, sql_type: int}
+      - {db_column: temperature, display_name: "Temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: calibration_constant, display_name: "Calibration constant", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: polarization, display_name: "Polarization", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: polarization_std, display_name: "Polarization std", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: snr, display_name: "SNR", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: step_width, display_name: "Step width", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: center_freq, display_name: "Center freq", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: freq_span, display_name: "Freq span", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: area, display_name: "Area", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: phase_voltage, display_name: "Phase voltage", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+      - {db_column: tune_voltage, display_name: "Tune voltage", unit: null, group: other, group_inferred: true, role: sensor, registry_status: named}
+  - name: QT
+    id_column: id
+    time_column: Timestamp
+    time_type: timestamp
+    time_zone: UTC  # MySQL timestamp is stored in UTC, read with session time_zone +00:00
+    time_zone_assumed: false
+    timestamp_resolution_s: 1  # assumed like the other timestamp tables; confirm with the QT profile
+    include: true  # mentor (2026-11-03): QT sensors are finalized and have lots of data
+    nominal_period_s: 1.0  # PROVISIONAL: QT is not profiled yet; replace with its measured mean spacing
+    channels:
+      - {db_column: fc501_ai, display_name: "FC501 flow", unit: null, group: flow, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: fc501_out, display_name: "FC501 controller output", unit: null, group: flow, group_inferred: true, role: controller_output, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: fc502_ai, display_name: "FC502 flow", unit: null, group: flow, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: fc502_out, display_name: "FC502 controller output", unit: null, group: flow, group_inferred: true, role: controller_output, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: lit501_ai, display_name: "LIT501 level", unit: null, group: other, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: pt501_ai, display_name: "PT501 pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: pt502_ai, display_name: "PT502 pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: pt503_ai, display_name: "PT503 pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: pt504_ai, display_name: "PT504 pressure", unit: null, group: pressure, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: ait501_ai, display_name: "AIT501 analyzer", unit: null, group: other, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: ti501_ai, display_name: "TI501 temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: ti502_ai, display_name: "TI502 temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: ti503_ai, display_name: "TI503 temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: ti504_ai, display_name: "TI504 temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: ti505_ai, display_name: "TI505 temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+      - {db_column: ti523_ai, display_name: "TI523 temperature", unit: null, group: temperature, group_inferred: true, role: sensor, registry_status: inferred, notes: "Display name inferred from the instrument tag; TODO: confirm meaning and unit."}
+  - name: sensor_data
+    id_column: id
+    time_column: timestamp
+    time_type: datetime
+    time_zone: America/New_York  # datetime has no zone; @@system_time_zone is EDT (profile)
+    time_zone_assumed: true
+    timestamp_resolution_s: null
+    include: false
+    reason: "Excluded: one value column with no channel name, purpose unknown (section 3.3)."
+    nominal_period_s: null
+    channels:
+      - {db_column: value, display_name: "Value", unit: null, group: other, group_inferred: true, role: sensor, registry_status: inferred, notes: "TODO: purpose of sensor_data unknown (section 3.4)."}
+  - name: stress_test_data
+    id_column: id
+    time_column: Timestamp
+    time_type: datetime
+    time_zone: America/New_York  # datetime has no zone; @@system_time_zone is EDT (profile)
+    time_zone_assumed: true
+    timestamp_resolution_s: null
+    include: false
+    reason: "Excluded: presumably test data (section 3.3)."
+    nominal_period_s: null
+    channels:
+      - {db_column: col1, display_name: "Col1", unit: null, group: other, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: col2, display_name: "Col2", unit: null, group: other, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: col3, display_name: "Col3", unit: null, group: other, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: col4, display_name: "Col4", unit: null, group: other, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}
+      - {db_column: col5, display_name: "Col5", unit: null, group: other, group_inferred: true, role: sensor, registry_status: unnamed, notes: "TODO: real channel name unknown (section 3.4)."}

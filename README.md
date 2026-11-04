@@ -1,80 +1,755 @@
 # Anomaly stream simulator
 
-A seeded, configurable, synthetic multi-channel data stream simulator. It injects known anomalies and records exact ground truth. It is the data foundation for a small LLM that answers questions about abnormalities in a sensor stream (inspired by detector and target monitoring for a nuclear physics experiment).
+A seeded, configurable, synthetic multi-channel data stream simulator. It injects known anomalies into healthy sensor signals and records exact ground truth for every one of them.
 
-Everything is synthetic. No real experiment data, no network calls. Channel names are generic placeholders.
+It is the data foundation for a larger project: a small fine-tuned LLM that answers questions about abnormalities in a sensor stream (inspired by detector and target monitoring for a nuclear physics experiment). The LLM never sees raw data. Plain-code detectors watch the stream and write conclusions to a state store, and the LLM only phrases answers from a short text summary. This repo holds the whole pipeline: the simulator, the detectors, the state store and summary, the training data and fine-tuning for the LLM, and the Discord bot.
 
-This README holds progress notes. The full reference (every config field, every anomaly type, label schema, replay contract) is planned for Phase 4.
+Everything in this repo runs on synthetic data. No real experiment data is stored here, and nothing connects to the real database unless a person runs the profiler or the monitor by hand. The channel names in `configs/` and in batch runs (`polarization`, `beam_current`, ...) are generic placeholders and do not claim to match any real instrument. The real-layout work (Phases R1 to R4) describes the real database's table and column names, but any data generated with those names is still simulated and labeled as such.
+
+## Contents
+
+1. [Status](#status)
+2. [Setup](#setup)
+3. [Quick start](#quick-start)
+4. [Scripts](#scripts)
+5. [Scenario config reference](#scenario-config-reference)
+6. [The healthy signal model](#the-healthy-signal-model)
+7. [Anomaly types](#anomaly-types)
+8. [Output files](#output-files)
+9. [Label schema](#label-schema)
+10. [Replay interface contract](#replay-interface-contract)
+11. [Determinism](#determinism)
+12. [How this plugs into the rest of the pipeline](#how-this-plugs-into-the-rest-of-the-pipeline)
+13. [Real ptdb layout (Phases R1 to R4)](#real-ptdb-layout-phases-r1-to-r4)
+14. [Monitoring pipeline](#monitoring-pipeline)
+15. [LLM training](#llm-training)
+16. [Discord bot](#discord-bot)
+17. [Repo layout](#repo-layout)
+18. [Known limits](#known-limits)
 
 ## Status
 
 | Phase | What | State |
 |---|---|---|
 | 1 | Core simulator: channels, 10 anomaly types, labels, config validation, replay, CSV/JSON output | Done, committed |
-| 2 | Batch generation: randomized scenarios, train/val/test split, manifest, summary table | Done, awaiting approval |
-| 3 | Inspection plots | Not started |
-| 4 | Full README | Not started |
-| 5 | Optional: reference detectors and scoring (only on request) | Not started |
+| 2 | Batch generation: randomized scenarios, train/val/test split, manifest, summary table | Done, committed |
+| 3 | Inspection plots (`sim/plotting.py`, `scripts/plot_run.py`) | Done |
+| 4 | Full README (this file) | Done |
+| 5 | Reference detectors and scoring (`monitor/`, `scripts/score_detectors.py`) | Done |
+| R1 | Real ptdb layout registry | Done |
+| R2 | Wide feeds, feed outages, SQLite fixture | Done |
+| R3 | Read-only, aggregates-only profiler | Done (not yet run on the real database) |
+| R4 | Fit the simulator to a profile, compare | Done (waiting for a real profile) |
+| Pipeline | State store, summary builder, live reader, monitor | Done |
+| LLM | Q&A dataset, LoRA training, evaluation | Done: Qwen3.5-4B LoRA trained on Shannon, 100% on held-out phrasings (see [LLM training](#llm-training)) |
+| Bot | Discord bot | Done (not connected to Discord) |
 
-Tests: 103 passing (`pytest`).
+Tests: 242 passing (`pytest`).
 
 ## Setup
 
-Python 3.11+ is required. The project was built with Python 3.14.2.
+Python 3.11 or newer is required. The project was built with Python 3.14.
+
+macOS or Linux:
 
     python3 -m venv .venv
     .venv/bin/pip install -r requirements.txt
     .venv/bin/python -m pytest
 
-All dependencies are pinned in `requirements.txt` (numpy, pandas, pyyaml, matplotlib, pytest and their dependencies).
+Windows (PowerShell or Git Bash):
 
-## Usage
+    python -m venv .venv
+    .venv/Scripts/python -m pip install -r requirements.txt
+    .venv/Scripts/python -m pytest
 
-One run from a config:
+Every dependency is pinned in `requirements.txt` (numpy, pandas, pyyaml, matplotlib, pytest, and what they depend on). The examples below write `python` for the virtual environment's interpreter.
+
+## Quick start
+
+    python scripts/make_run.py configs/mixed_demo.yaml      # writes out/mixed_demo/
+    python scripts/plot_run.py out/mixed_demo               # writes out/mixed_demo/plots/*.png
+    python scripts/make_batch.py --n 200 --master-seed 1    # writes out/batch/
+
+Then, in Python:
+
+    from sim import replay
+    for timestamp, values in replay("out/mixed_demo"):
+        print(timestamp, values)   # values is {channel: value}
+        break
+
+## Scripts
+
+All scripts take `--help`. Everything they write goes under `out/`, which is gitignored.
+
+### `scripts/make_run.py`: one run from a config
 
     python scripts/make_run.py configs/mixed_demo.yaml
+    python scripts/make_run.py configs/mixed_demo.yaml --out out --name my_run
 
-Writes `out/mixed_demo/data.csv`, `labels.json`, `config_used.yaml`.
+| Option | Default | Meaning |
+|---|---|---|
+| `config` | (required) | Scenario YAML file |
+| `--out` | `out` | Output root folder |
+| `--name` | config file name | Run folder name |
 
-A batch of randomized runs:
+Writes `out/<name>/data.csv`, `labels.json` and `config_used.yaml`, then prints the channels, the total number of samples, and the number of injected anomalies. A config error prints a readable message and exits with code 2.
+
+### `scripts/make_batch.py`: many randomized runs for training data
 
     python scripts/make_batch.py --n 200 --master-seed 1
 
-Writes `out/batch/<split>/run_XXXX/` (same three files) and `out/batch/manifest.json`, then prints a table of events per anomaly type per split. Use `--help` for all options. A 200-run batch takes about 30 s and about 250 MB.
+| Option | Default | Meaning |
+|---|---|---|
+| `--n` | 200 | Number of scenarios |
+| `--master-seed` | 1 | The one seed that determines the whole batch |
+| `--out` | `out/batch` | Output folder |
+| `--clean-frac` | 0.25 | Share of all runs with no anomalies |
+| `--multi-frac` | 0.25 | Share of all runs with several overlapping anomalies |
+| `--hard-frac` | 0.2 | Share of the non-clean runs that are hard cases |
+| `--split` | `80,10,10` | Train, val, test percentages |
+| `--min-hours` | 1 | Shortest scenario, in hours |
+| `--max-hours` | 12 | Longest scenario, in hours |
+| `--overwrite` | off | Replace an existing batch (only `manifest.json` and the three split folders are removed) |
 
-Replay a run as a stream (labels are never exposed):
+Writes `out/batch/<split>/run_XXXX/` (the same three files as `make_run.py`) and `out/batch/manifest.json`, then prints a table of scenario categories and events per anomaly type per split. A 200-run batch takes about 30 s and about 250 MB.
+
+How a batch is built:
+- **Categories use exact counts, not coin flips:** `clean` (no anomalies), `multi` (several overlapping anomalies), `hard` (a hard-case recipe), and `single` (one event, everything else).
+- **Hard cases:** a very slow drift (3 to 5 sigma over 40 to 70 percent of the run), 2 or 3 spikes of only 3.5 to 5 sigma, a spike followed a few seconds later by a step shift, or a stuck sensor.
+- **Primary anomaly types are handed out round-robin**, so every type appears about equally often before the split.
+- **Every decoupling comes with a driver:** a held drift or step on the source channel. Without it the decoupling would be invisible, because the coupled contribution is small while the source sits at its baseline.
+- **Splits are per scenario.** Each scenario lands in exactly one split and has its own distinct seed.
+
+### `scripts/plot_run.py`: inspection plots
+
+    python scripts/plot_run.py out/mixed_demo
+    python scripts/plot_run.py configs/mixed_demo.yaml        # generates the run first
+    python scripts/plot_run.py out/mixed_demo --no-scatter
+
+| Option | Default | Meaning |
+|---|---|---|
+| `source` | (required) | A run folder, or a scenario YAML (generated into `--out` first) |
+| `--out` | `out` | Output root, used only when `source` is a YAML |
+| `--no-scatter` | off | Skip the decoupling scatter plots |
+
+Writes PNG files to `<run folder>/plots/`. No window is opened.
+- `overview.png`: one panel per channel. Each panel shows the samples, the configured baseline as a dashed line, and a shaded +/- 3 sigma band. Each labeled anomaly is shaded and named, with one fixed color per anomaly type. Very short events (such as 1 s spikes) are drawn as thin vertical lines. A small triangle at the top edge marks `first_detectable`. Missing data (dropouts, and rows that are absent) shows as gaps in the line.
+- `decoupling_<channel>_<label id>.png`: one per decoupling label. It is a scatter of the source channel against the coupled channel, with healthy samples and samples inside the decoupling window in different colors, plus the dashed line the healthy coupling follows.
+
+Plots read `labels.json` on purpose, because they are for people inspecting ground truth. Detectors must use `replay`, which never exposes labels.
+
+### `scripts/show_registry.py`: the real ptdb layout
+
+    python scripts/show_registry.py          # the 29 included channels
+    python scripts/show_registry.py --all    # every channel of every table
+
+Prints the channel registry from `configs/ptdb_layout.yaml`. See [Real ptdb layout](#real-ptdb-layout-phases-r1-to-r4).
+
+## Scenario config reference
+
+A scenario is a YAML file (or a Python dict with the same shape). Every key is validated before anything is generated, and an unknown key, a wrong type, or an impossible value gives an error that says what to fix.
+
+    seed: 2002
+    start_time: "2026-01-01T08:00:00"
+    duration_seconds: 21600
+    channels:
+      - name: polarization
+        baseline: 41.0
+        sigma: 0.15
+        slow_wander: {amplitude: 0.04, period_seconds: 7200}
+      - name: nmr_signal
+        baseline: 2.5
+        sigma: 0.03
+        sample_rate_hz: 0.2
+        couples_to: {channel: polarization, gain: 0.15}
+    anomalies:
+      - {channel: polarization, type: linear_drift, start: 7200, duration: 12000,
+         magnitude: -3.5, magnitude_unit: absolute, hold_after: true}
+
+### Top level
+
+| Key | Required | Type | Meaning |
+|---|---|---|---|
+| `seed` | yes | integer >= 0 | Drives all randomness in the run |
+| `start_time` | yes | ISO time string, no zone | Wall-clock time of the first sample, for example `2026-01-01T08:00:00` |
+| `duration_seconds` | yes | number > 0 | Length of the run |
+| `channels` | yes | nonempty list | Channel definitions, see below. Names must be unique |
+| `anomalies` | no | list | Anomalies to inject, see [Anomaly types](#anomaly-types). Default: none |
+
+### Channel fields
+
+| Key | Required | Default | Meaning |
+|---|---|---|---|
+| `name` | yes |  | Unique channel name |
+| `baseline` | yes |  | Healthy mean level, in channel units |
+| `sigma` | yes |  | Total healthy standard deviation (> 0). For a coupled channel this includes the part that comes from the source |
+| `sample_rate_hz` | no | 1.0 | Samples per second (> 0). Sample k is at k / rate seconds |
+| `ar1_phi` | no | 0.0 | Noise memory in [0, 1). 0 is white noise; closer to 1 means slower, smoother noise. The noise standard deviation stays `sigma` either way |
+| `slow_wander.amplitude` | no | 0.0 | Amplitude (>= 0) of a harmless slow sinusoid on top of the baseline |
+| `slow_wander.period_seconds` | no | 3600 | Period of that sinusoid (> 0) |
+| `couples_to.channel` | no | none | Name of a source channel this one follows |
+| `couples_to.gain` | no | 0.15 | How strongly this channel follows the source's deviation |
+
+Coupling rules:
+- The source channel must exist, a channel cannot couple to itself, and coupling chains cannot loop.
+- The gain must leave the channel some noise of its own: `|gain| * sigma_source < sigma`. Otherwise the error message gives the largest allowed gain.
+
+### Anomaly fields
+
+Every anomaly has these three keys, plus type-specific parameters (next section):
+
+| Key | Meaning |
+|---|---|
+| `channel` | Name of the channel to inject into |
+| `type` | One of the ten types below |
+| `start` | Seconds from the start of the run (>= 0 and before the end) |
+
+General rules:
+- `duration`, where present, must be positive, and the window must end inside the run.
+- Every type with a `magnitude` also takes `magnitude_unit`: `sigma` (the default, magnitude times the channel's sigma) or `absolute` (channel units). A magnitude of 0 is rejected.
+- A window too short to contain any sample of the channel is rejected.
+- Anomalies compose: any number can be active on one channel at the same time, and their effects add up (or multiply, for noise growth).
+
+## The healthy signal model
+
+A channel's healthy value at sample k is:
+
+    value = baseline
+          + wander(t)                    amplitude * sin(2 pi t / period_seconds)
+          + own_noise(k)                 white or AR(1) noise
+          + gain * source_deviation(t)   only for coupled channels
+
+- **Own noise** is AR(1): `x[k] = phi * x[k-1] + e[k]`, where the innovation `e` is scaled so the stationary standard deviation is the channel's own sigma. With `phi = 0` this is plain white noise.
+- **Own sigma** of a coupled channel is `sqrt(sigma^2 - (gain * sigma_source)^2)`, so the channel's total standard deviation is still the configured `sigma`.
+- **Source deviation** is everything in the source except its baseline: its wander, its noise, and any physical anomaly injected into it. A coupled channel therefore follows a drift on its source, which is what makes decoupling detectable.
+- **Different sample rates:** the source's deviation is linearly interpolated onto the coupled channel's sample times.
+- **Time** is stored internally as integer microseconds since the start, so channels with different rates merge cleanly.
+
+## Anomaly types
+
+There are two kinds of anomaly:
+- **Physical anomalies** change the real quantity. Channels coupled to this one see them too.
+- **Measurement faults** (`stuck_sensor`, `dropout`) corrupt only the reported value. They are applied last and are invisible to coupled channels.
+
+Window conventions:
+- Ramps (`linear_drift`, `exponential_drift`, `noise_growth`, `decoupling`) use the closed window [start, end]: the sample at `end` has the full effect.
+- Everything else uses [start, end): the sample at `end` is not affected.
+- With `hold_after: true` a ramp keeps its final effect after `end`, and the label's `end` is null.
+
+| Type | Required | Optional (default) | What it does | Physical intuition |
+|---|---|---|---|---|
+| `spike` | `magnitude` | `magnitude_unit` (sigma) | Adds `magnitude` to the single sample nearest `start` | A one-off electrical glitch or a cosmic ray hit on the readout |
+| `spike_burst` | `magnitude`, `count` (integer >= 2), `spacing` (s, at least one sample period) | `magnitude_unit` (sigma), `alternate_sign` (false) | `count` spikes, `spacing` seconds apart, signs alternating if asked | An intermittent connector or a ringing pickup that fires several times |
+| `step_shift` | `magnitude` | `magnitude_unit` (sigma), `duration` (forever) | The level jumps by `magnitude` at `start` and stays until `start + duration` | A setpoint change, a gain switch, or a component suddenly changing state |
+| `linear_drift` | `magnitude`, `duration` | `magnitude_unit` (sigma), `hold_after` (false) | The level moves linearly from 0 to `magnitude` over `duration` | Slow loss of target polarization, or a calibration creeping off |
+| `exponential_drift` | `magnitude`, `duration` | `magnitude_unit` (sigma), `hold_after` (false), `time_constant` (duration / 3) | Slow start, accelerating rise, reaching `magnitude` at the end. A smaller `time_constant` gives a later, sharper rise | A runaway such as a slowly building thermal or vacuum problem |
+| `noise_growth` | `factor` (> 1), `duration` | `hold_after` (false) | The channel's own noise grows linearly from 1x to `factor` x. The mean is untouched | A degrading cable or amplifier, or growing vibration |
+| `transient_decay` | `magnitude`, `time_constant` (s) | `magnitude_unit` (sigma) | A jump of `magnitude` at `start` that decays as exp(-t / time_constant). The label ends after 5 time constants | A beam trip or a quench that recovers on its own |
+| `dropout` | `duration` | none | Samples in the window become missing (NaN) | The readout or DAQ stops reporting for a while |
+| `stuck_sensor` | none | `duration` (forever) | The reported value freezes at the last good reading, with zero noise | A frozen readout or a hung sensor driver that keeps resending one value |
+| `decoupling` | `duration` | `end_gain_fraction` (0.0, in [0, 1)), `hold_after` (false) | The coupling gain falls linearly to `end_gain_fraction` x gain. Only valid on a channel with `couples_to` | Two measurements of the same thing stop agreeing, for example an NMR signal no longer tracking polarization |
+
+Notes on specific types:
+- `spike` and `spike_burst` land on the nearest sample, so the label times are on the sample grid.
+- `decoupling` looks normal on each channel alone. It shows up only when the source moves and the coupled channel fails to follow. That is why batch runs always pair it with a driver anomaly on the source.
+- `stuck_sensor` uses the last non-missing value before the window. If there is none, it uses the first value in the window.
+
+## Output files
+
+A run folder holds three files:
+
+| File | Contents |
+|---|---|
+| `data.csv` | A `timestamp` column (ISO, no zone), then one column per channel in config order. Rows are the union of all channels' sample times |
+| `labels.json` | A list of label records, one per injected anomaly (see [Label schema](#label-schema)) |
+| `config_used.yaml` | The exact config that made the run, seed included. Feeding it back to `make_run.py` reproduces the run |
+
+In `data.csv` an **empty cell** means the channel has no sample at that time (for example a 0.2 Hz channel between its samples). A missing reading (a dropout) is written as the text **`nan`**. The two cases stay distinct.
+
+A batch adds `manifest.json`. It records:
+- `master_seed`, `n`, and the batch `params`;
+- `split_counts`;
+- a `summary` (categories and events per type per split);
+- `runs`: one entry per scenario with `run`, `path`, `split`, `seed`, `category`, `hard_kind`, `channels`, `duration_seconds`, `n_anomalies`, `anomaly_types` and `anomaly_counts`.
+
+## Label schema
+
+Each injected anomaly gives one record. Labels come from the injected model only, never from a detector.
+
+    {
+      "id": "ev_0001",
+      "channel": "beam_current",
+      "type": "spike",
+      "start": "2026-01-01T08:50:00",
+      "end": "2026-01-01T08:50:01",
+      "first_detectable": "2026-01-01T08:50:00",
+      "magnitude": 0.4,
+      "magnitude_sigma": 8.0,
+      "params": {"start_offset_seconds": 3000.0, "magnitude_unit": "sigma", "magnitude": 8.0},
+      "severity": "low"
+    }
+
+| Field | Meaning |
+|---|---|
+| `id` | `ev_NNNN`, numbered in order of start time (ties broken by position in the config) |
+| `channel` | The channel the anomaly was injected into |
+| `type` | The anomaly type |
+| `start` | ISO time the effect begins (snapped to the sample grid for spikes) |
+| `end` | ISO time the effect ends, or null when it never ends (`hold_after: true`, or a step or stuck sensor with no duration). For a spike it is one sample period after `start`. For `transient_decay` it is start plus 5 time constants, capped at the run end |
+| `first_detectable` | First sample time at which the injected effect exceeds 1 sigma of the channel, computed from the model. Null if that never happens. It is a property of the data, not a detector's result |
+| `magnitude` | Size of the effect in channel units (see notes below) |
+| `magnitude_sigma` | `magnitude` divided by the channel's sigma, or null where that has no meaning |
+| `params` | Every parameter used, defaults filled in, plus `start_offset_seconds` |
+| `severity` | `low` for an isolated spike or a dropout under 5 s, `high` for everything else |
+
+What `magnitude` and `first_detectable` mean for the unusual types:
+- **`noise_growth`:** `magnitude` is the final factor, and `magnitude_sigma` is null. "Detectable" means the extra noise, `own_sigma * sqrt(f^2 - 1)`, exceeds 1 sigma.
+- **`stuck_sensor`:** `magnitude` is the frozen value minus the baseline. It becomes detectable when the frozen value differs from the true value by more than 1 sigma.
+- **`dropout`:** no magnitude. It is detectable at its first missing sample.
+- **`decoupling`:** no magnitude. It is detectable when the missing coupled contribution, `(gain - gain(t)) * source_deviation`, exceeds 1 sigma.
+
+## Replay interface contract
+
+`replay` turns a run into a stream of events, the way a detector would see live data:
 
     from sim import replay
-    for timestamp, values in replay("configs/mixed_demo.yaml"):
-        ...  # values is {channel: value}; a channel appears only when it has a sample
 
-## Layout
+    for timestamp, values in replay("configs/mixed_demo.yaml"):   # generate on the fly
+        ...
+    for timestamp, values in replay("out/mixed_demo"):            # read a run folder back
+        ...
+    for timestamp, values in replay(cfg_dict, speed=60):          # real time, 60x faster
+        ...
 
-    configs/   healthy.yaml, mixed_demo.yaml
-    sim/       scenario (config), channels (healthy model), anomalies, labels, stream (generate and replay), io, batch
-    scripts/   make_run.py, make_batch.py
-    tests/     pytest suite
-    out/       generated data (gitignored)
+`source` can be a `ScenarioConfig`, a config dict, a path to a scenario YAML (generated in memory), or a run folder or its `data.csv` (read back).
 
-## Design decisions so far
+The contract:
+1. Each event is `(timestamp, {channel: value})`, where `timestamp` is a `datetime`.
+2. Events arrive in strictly increasing time order.
+3. A channel appears in an event only when it has a sample at that time.
+4. A missing reading (dropout) appears as `NaN`. It is present, but it has no value.
+5. No label information is ever exposed. When reading a run folder, `labels.json` is never opened.
+6. `speed=None` (the default) yields as fast as possible. A positive `speed` sleeps between events so that one simulated second takes `1 / speed` real seconds.
 
-Simulator (Phase 1):
-- Same seed and config give byte-identical output. Each channel draws noise from its own child of `SeedSequence(seed)`, so adding or removing an anomaly never changes the healthy noise.
-- `sigma` is a channel's total healthy standard deviation. For a coupled channel its own noise is `sqrt(sigma^2 - (gain * sigma_source)^2)`, and a gain that leaves no own noise is rejected. Default coupling gain is 0.15.
-- A coupled channel follows its source's total deviation, including injected anomalies. The exception is measurement faults (`dropout`, `stuck_sensor`), which are not seen by coupled channels.
-- Every anomaly with a magnitude takes `magnitude` plus `magnitude_unit: sigma | absolute` (default `sigma`).
-- Ramps (drifts, noise growth, decoupling) include the sample at `end`, so a drift reaches its full magnitude there. With `hold_after: true` the effect persists and the label `end` is null.
-- `first_detectable` is the first time the injected effect exceeds 1 sigma, computed from the model and not from any detector. It is null if that never happens.
-- Label fields for odd types: `dropout` has no magnitude. `noise_growth` magnitude is the final factor (no sigma value). `stuck_sensor` magnitude is the frozen value minus baseline. `decoupling` has no magnitude.
-- Severity: isolated spike and dropout under 5 s are "low". Everything else is "high".
-- In `data.csv` an empty cell means no sample at that time. A dropout is written as `nan`.
+For bulk work, `sim.generate(config)` returns a `StreamResult` with per-channel arrays (`t_us`, `values`) and the labels. It is used for batches and tests, not by detectors.
 
-Batch (Phase 2):
-- Scenario categories use exact counts: clean (25% of all runs), multi (25% of all runs), hard (20% of the non-clean runs), single (the rest). Primary anomaly types are assigned round-robin.
-- Hard cases: very slow drift, spikes of 3.5 to 5 sigma, a step shortly after a spike, stuck sensor.
-- Every decoupling comes with a driver anomaly (a held drift or step on the source channel), otherwise it would be invisible.
-- Each scenario has a unique seed derived from the master seed. Splits are assigned per scenario from the master seed. Anomaly types missing from a split are reported in the summary, not hidden.
+## Determinism
+
+The same seed and config always give byte-identical output files.
+
+- All randomness comes from `numpy.random.Generator` objects seeded from the config. There is no global random state and no clock.
+- **Each channel draws its noise from its own child of `SeedSequence(seed)`**, chosen by the channel's position in the config. Adding, removing or changing an anomaly therefore never changes the healthy noise of any channel. The tests use this to measure an injected effect exactly: they generate with and without the anomaly and subtract.
+- **Output formatting is fixed:** numbers use `.10g`, JSON keys come in a fixed order, and line endings are always `\n`.
+- **Batches:** the master seed is split into one stream for the plan (categories and splits) and one child per scenario. Each scenario child is split again into a config stream and the scenario's own `seed`. The same `--n` and `--master-seed` give the same batch.
+
+## How this plugs into the rest of the pipeline
+
+Every piece of the pipeline now exists, and each runs on simulated data. The only parts that need people are running the profiler and the monitor against the real database, and connecting the bot to Discord.
+
+    simulator run, SQLite fixture, or the real ptdb (read-only)
+            |
+            |  (timestamp, {channel: value}) events: replay(), replay_layout(), or monitor/ingest.py
+            v
+    detectors  --------------->  state store  --------------->  summary builder  ----->  LLM  ----->  Discord bot
+    monitor/detectors.py         monitor/state.py               monitor/summary.py      training/   bot/
+    monitor/engine.py
+
+1. **Detectors** consume events only. They never see labels. See [Monitoring pipeline](#monitoring-pipeline).
+2. **The state store** holds the current conclusions: the channel, the kind of abnormality, since when, how large, and whether it is still active. It saves to `state.json`.
+3. **The summary builder** turns the store into a short factual text, written to `summary.txt`.
+4. **The LLM** is a small instruct model with a LoRA adapter. It answers questions from the summary only. See [LLM training](#llm-training).
+5. **The Discord bot** reads `summary.txt` and answers questions. See [Discord bot](#discord-bot).
+
+## Real ptdb layout (Phases R1 to R4)
+
+`real-data-alignment-prompt.md` describes the work that aligns the simulator with the real MySQL database `ptdb`. Channels are keyed `<table>.<db_column>`, for example `Labjack.fridge_vapor_pressure`.
+
+**R1, layout registry.**
+- `configs/ptdb_layout.yaml` describes all 11 tables and 109 columns, with the real spelling. Typos such as `seperator` and `buffle` are kept.
+- Three feeds with 29 channels are included: Flow_Rates, Labjack and QT (QT replaced Lakeshore_Fridge_Temp on 2026-11-03, see below). Every other table has `include: false` and a reason.
+- `sim/registry.py` validates the layout against the reference schema in `sim/ptdb_schema.py`.
+- Every unit is unknown, every group is inferred, and unnamed channels are flagged. The open questions are TODOs at the top of the layout file.
+- Print the registry with `python scripts/show_registry.py`.
+
+**R2, wide feeds and a SQLite fixture.** A feed is a table: one row carries all of its channels at one time. `sim/layout_scenario.py` builds every included channel with the existing simulator, at its feed's period, then adds realistic healthy irregularity:
+- a small positive insert-time jitter (5 percent of the period by default);
+- flooring to whole seconds, so close rows can share a timestamp;
+- occasional single-row gaps;
+- values rounded to single precision, since ptdb stores `float`.
+
+On top of that:
+- **Outages:** a new anomaly type, `feed_outage`, removes every row of a feed for a window. The rows are absent, not NaN.
+- **Labels** use the realized row times.
+- **Real names, simulated data:** the run is marked `synthetic: true`, and its plots say SIMULATED.
+
+Commands:
+
+    python scripts/make_layout_scenario.py --hours 6 --seed 1 --anomalies mixed --fixture --plot
+    python scripts/make_fixture_db.py out/layout/seed1_mixed --late-fraction 0.01 --dup-fraction 0.005 --null-fraction 0.01
+
+- **Output folder:** `out/layout/<name>/` gets `feeds/<Table>.csv`, `labels.json`, `meta.json`, `config_used.yaml`, and optionally `fixture.sqlite` and `plots/feed_<Table>.png`.
+- **The fixture** has the real table and column names, an `id INTEGER PRIMARY KEY` in insertion order, a TEXT UTC time column with an index, and REAL value columns.
+- **Stress options:** late, duplicate and NULL rows are seeded and deterministic.
+- **Replay:** `sim.replay_layout(run)` yields one event per feed row, with NULL values left out and aware UTC timestamps.
+
+**R3, read-only profiler.** `scripts/profile_db.py` and `sim/profiler/` collect aggregate statistics without a full scan.
+
+Every query passes `sim/profiler/guard.py` first. The guard allows only single `SELECT`, `SHOW` and session `SET` statements. It rejects everything else, including:
+- `SET GLOBAL`
+- `INTO OUTFILE`
+- locking reads
+- multiple statements
+
+What happens on connect and how the reads work:
+- **Session setup:** the MySQL adapter makes the session read-only, sets `time_zone = '+00:00'`, and sets a 30 s query timeout chosen by server version (`max_statement_time` on MariaDB, `max_execution_time` on MySQL).
+- **Sampling:** it reads `MIN(id)` and `MAX(id)` to find each table's range, samples 200 chunks of 5000 consecutive ids, takes 2000 timeline probes by primary key to locate long gaps, and reads three 24 hour correlation windows.
+- **No raw rows:** rows exist only in memory, one chunk at a time.
+- **Allowlist:** the JSON output is checked against an allowlist schema before it is written.
+- **`--dry-run`** prints every planned statement and connects to nothing.
+
+The output files are `out/profile/ptdb_profile.json` and `ptdb_profile.md`, both gitignored and both headed "AGGREGATES ONLY. Review before sharing."
+
+- **Per table:** id bounds, ordering and duplicate shares, spacing percentiles and shares, gap counts, and the 20 largest gaps (the only individual timestamps).
+- **Per channel:** n, null fraction, min, max, mean, std, median, MAD sigma, short-term noise sigma and lag-1 autocorrelation, slow-component share, and stuck-value indicators.
+- **Correlations:** the top 30 channel pairs by correlation of first differences and of levels.
+
+**R4, fit the simulator to a profile.**
+- `sim/from_profile.py` maps the profile to the simulator:
+  - baseline from the median;
+  - sigma and `ar1_phi` from the noise estimates, corrected with a calibration curve, because the rolling-median residual underestimates both for correlated noise;
+  - slow wander from the slow-component share;
+  - per feed: the period, jitter and single-row gap rate.
+- **Couplings** come only from a `couplings:` list you write.
+- `scripts/compare_sim_to_profile.py` fits, simulates, writes a fixture, re-profiles it with the same code, and flags channels whose noise sigma or lag-1 differs by more than 25 percent.
+- **What the fit does not capture:** regime changes and operating modes, bursty or heavy-tailed noise, the shape and period of slow wander, daily cycles, couplings you did not list, value-dependent noise, readout quantization, sentinel values, and anything in unsampled rows.
+
+Commands:
+
+    python scripts/make_layout_scenario.py --hours 24 --seed 1 --profile out/profile/ptdb_profile.json
+    python scripts/compare_sim_to_profile.py out/profile/ptdb_profile.json --couplings configs/couplings.yaml
+
+### Running the profiler on Shannon (you, by hand)
+
+Use a fresh virtual environment, never the machine's main Python or conda environment, and an off-peak time. Use a read replica host if one exists.
+
+    git clone <this repo> && cd <repo>
+    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+    .venv/bin/python scripts/profile_db.py --dry-run                      # check every query first
+    export PTDB_HOST=... PTDB_PORT=3306 PTDB_USER=... PTDB_PASSWORD=... PTDB_DATABASE=ptdb
+    .venv/bin/python scripts/profile_db.py --pause-seconds 0.5
+
+Review `out/profile/ptdb_profile.md` yourself before sharing any part of it with anyone, including in a chat.
+
+### Data safety rules
+
+- Nothing in this repo connects to the real database on its own. The profiler and the live monitor are run by hand, read-only, through the guard.
+- Credentials come only from environment variables (see `.env.example`). `.env` and `out/profile/` are gitignored, and a test checks that.
+- The profiler writes aggregates only, checked by an allowlist and by a test that searches its output for raw readings.
+- Simulated data with real channel names is marked `synthetic: true`, and its plots say SIMULATED.
+
+### What the real profile showed (2026-11-03)
+
+The first read-only profile covered Flow_Rates, Labjack and Lakeshore_Fridge_Temp: 900 statements, aggregates only. It is stored in `out/profile/` (gitignored). The real data differs a lot from the assumptions in section 3 of the prompt:
+
+| Finding | Consequence |
+|---|---|
+| Server 10.3.39-MariaDB, `@@system_time_zone` EDT | Query timeout uses `max_statement_time`; the two `datetime` tables are taken as America/New_York |
+| The logger was down for about 248 of 368 days (longest gap 2026-03-03 to 2026-08-13) | Periods from row counts were wrong. The measured mean spacing while running is 1.354 s (Flow_Rates) and 1.105 s (Labjack) |
+| 40 to 64 percent NULLs and 19 to 40 percent shared timestamps | Rows look like partial rows from more than one writer. The "missing" detector for wide feeds is now time-based, so healthy partial rows are not alarms |
+| 2 percent of Flow_Rates rows have an earlier timestamp than the row before | Late rows are real; the live reader reorders within a 60 s window |
+| Every Lakeshore_Fridge_Temp value is 0 | The mentor confirmed the sensors are not connected yet. The feed is deferred |
+| `root_exhaust_pressure` median -41030.7; `thermocouple` and `fridge_vapor_pressure` hold values for thousands of rows | Not a known error code (mentor). Channels that hold values or are constant get `stuck_normal` (no stuck alarms) and a sigma floor |
+| Operating modes (for example `buffer_pressure` from -10 to +9.8) | Not modeled yet. Detectors calibrated on one mode will alarm on a mode change |
+
+Fitting the simulator to this profile (`scripts/compare_sim_to_profile.py`) matches the short-term noise sigma and lag-1 autocorrelation of 20 of 21 channels. The exception is `heat_exchanger_flow`, which is held constant 81 percent of the time. That match is narrow: the fit does not reproduce modes, sentinel values, held values or long outages.
+
+**Feeds now included (mentor, 2026-11-03):** Flow_Rates, Labjack and QT, 29 channels in total. The QT sensors are finalized and have lots of data. QT display names are inferred from the instrument tags (FC flow controller, LIT level, PT pressure, AIT analyzer, TI temperature, `_out` controller output). QT's period is a provisional 1.0 s until QT is profiled:
+
+    cd ~/spinquest-discord-anomaly-checker
+    TABLES=QT OUT=out/profile_qt bash scripts/shannon_profile.sh
+
+After that, set `nominal_period_s` for QT in `configs/ptdb_layout.yaml` to the profile's `mean_spacing_s`, and fit with `python scripts/compare_sim_to_profile.py out/profile_qt/ptdb_profile.json`.
+
+## Monitoring pipeline
+
+**Detectors** (`monitor/detectors.py`). Each channel gets one `ChannelMonitor`, calibrated from healthy data: the target is the median, and sigma is the MAD estimate.
+
+| Detector | Rule |
+|---|---|
+| spike | \|z\| > 5 against an adaptive mean (alpha 0.01, not updated on flagged points). Confirmed only when the next sample is back within 3 sigma and the value is at least 3 sigma from the healthy target, so a step is not reported as a spike |
+| drift_up, drift_down | Two-sided CUSUM against the frozen target: slack 0.5 sigma, inputs clipped to 3 sigma, `since` = when the score left zero, score capped at 2 h so it clears soon after recovery |
+| stuck | The same value for at least 20 samples and 60 s |
+| noisy | An EWMA of squared sample-to-sample differences above 4 times its healthy level (level changes do not count as noise) |
+| missing | 3 or more missing readings in a row. In wide feeds, a channel absent from its feed's row counts as missing |
+| feed_outage | No row from a feed for 5 periods |
+| decoupled | CUSUM on the coupled channel's residual after removing gain times the source deviation (only for couplings given in the config) |
+
+Threshold calibration matters. With the plain Phase 5 thresholds (a 5 sigma CUSUM for every channel), healthy channels alarm constantly: an ARL of about 930 samples, plus far more on autocorrelated or wandering channels. By default (`adaptive=True`) every channel's thresholds come from its own healthy data:
+- **Autocorrelation correction:** CUSUM inputs are divided by sqrt((1 + phi) / (1 - phi)), where phi is the healthy lag-1 autocorrelation.
+- **The threshold is the largest of three values:**
+  - the Phase 5 value of 5;
+  - the Siegmund threshold for one false alarm per channel per 30 days;
+  - 1.5 times the largest score seen on the healthy data.
+- **Noise and decoupling** thresholds are calibrated the same way.
+
+**Engine and state** (`monitor/engine.py`, `monitor/state.py`, `monitor/summary.py`). `Engine.from_healthy(healthy_events)` calibrates every channel, then `engine.step(t, values)` runs one event through the detectors, and `build_summary(engine.store)` gives the text the LLM sees:
+
+    Status at 2026-01-01 13:59 UTC. 5 channels monitored, 3 abnormal.
+    - polarization: running low since 10:03 (about 3.49 below normal, 22.9 sigma). Normal is 41.
+    - rf_power: running high since 11:59 (about 2.47 above normal, 6.2 sigma). Normal is 100.0.
+    - nmr_signal: no longer tracking polarization since 12:31. Normal is 2.5.
+    Normal: beam_current, target_temp.
+
+The summary names every normal channel, so the model never has to guess whether an unlisted name exists.
+
+**Live reader** (`monitor/ingest.py`). `PtdbReader` polls each included table by its `id` watermark:
+
+    SELECT ... WHERE id > :last_id ORDER BY id LIMIT :n
+
+It goes through the same adapters and guard as the profiler.
+- **Duplicates:** rows with the same time and values as a recent row are dropped.
+- **Late rows:** rows are reordered within a 60 s window.
+- **NULLs:** left out of the event.
+- **Backfill:** reads the table that is furthest behind first, so feeds with different row rates interleave correctly.
+- **Live use:** `poll()` reads new rows; `start_at_time()` and `start_at_end()` set the watermarks.
+
+**Running it** (`scripts/run_monitor.py`):
+
+    python scripts/run_monitor.py --run out/mixed_demo --healthy configs/healthy.yaml
+    python scripts/run_monitor.py --layout-run out/layout/seed1_mixed --calibrate-minutes 60
+    python scripts/run_monitor.py --sqlite out/layout/seed1_stress/fixture.sqlite --follow
+    python scripts/run_monitor.py --mysql --calibrate-minutes 360 --follow     # real ptdb: you, by hand, on Shannon
+
+It writes `out/monitor/<name>/state.json`, `summary.txt` and `snapshots.jsonl`. With `--follow` it keeps polling and rewriting the first two, and the bot reads them. Calibrate on at least a few hours of healthy data; 40 minutes is too short and gives a few small false drifts.
+
+### Detector results (Phase 5)
+
+    python scripts/make_batch.py --n 200 --master-seed 1
+    python scripts/score_detectors.py out/batch --split all
+    python scripts/score_detectors.py out/batch --split all --plain
+
+How each run was scored:
+- **Calibration:** on a separate 6 hour healthy run of the same system (the same config with every anomaly removed and a different seed).
+- **Detection:** through `replay` only, never reading labels.
+- **Matching:** detections are matched to labels of a compatible type first.
+- **"Masked":** a label on a channel that was already in alarm for an earlier anomaly.
+
+All 200 runs, master seed 1:
+
+| Anomaly type | n | Detected (adaptive) | Rate | Incl. masked | Median delay s | Rate with plain Phase 5 thresholds |
+|---|---|---|---|---|---|---|
+| decoupling | 13 | 13 | 100% | 100% | -35 | 100% |
+| dropout | 20 | 17 | 85% | 90% | 2 | 85% |
+| exponential_drift | 22 | 20 | 91% | 100% | -182 | 95% |
+| linear_drift | 44 | 42 | 95% | 100% | 3 | 95% |
+| noise_growth | 16 | 16 | 100% | 100% | 479 | 100% |
+| spike | 51 | 30 | 59% | 69% | 0 | 71% |
+| spike_burst | 10 | 9 | 90% | 100% | 0 | 80% |
+| step_shift | 31 | 30 | 97% | 100% | 7 | 90% |
+| stuck_sensor | 30 | 30 | 100% | 100% | 52 | 100% |
+| transient_decay | 20 | 18 | 90% | 100% | 5 | 90% |
+| **False alarms per hour, clean runs** | | **0.049** | | | | **65.9** |
+
+Delay is the alarm time minus `first_detectable`. A negative delay means the CUSUM fired before the effect passed 1 sigma.
+
+Under 90 percent:
+- **spike:** the batch's hard cases include spikes of only 3.5 to 5 sigma, below the 5 sigma threshold by design.
+- **dropout:** dropouts of 1 to 2 samples are shorter than the 3-sample rule.
+
+The plain thresholds catch slightly more spikes, but at 66 false alarms per hour they are not usable. Thresholds were changed openly, for the reasons above, and both modes stay available (`--plain`).
+
+## LLM training
+
+**Dataset** (`training/make_dataset.py`, `training/qa.py`):
+
+    python -m training.make_dataset --batch out/batch --layout-runs 120 --out out/qa
+
+- **Snapshots:** the real detector pipeline runs over every batch run and over 120 wide-feed runs with real names. Each wide-feed run has its own random channel levels and noise, so the model sees many number formats. Snapshots of the state store are taken at random times.
+- **Questions:** each snapshot gives one summary and up to six examples. The question types are: overall status, a named abnormal or normal channel, since when, how big, which channels are normal, feeds, recent spikes, plus questions the summary cannot answer (why, what to do, predictions, channels that are not monitored).
+- **Answers** use only facts in the summary. For the unanswerable questions, the answer says so.
+- **Format:** each example is in chat format (system, user = summary plus question, assistant = answer) and carries fact checks: strings the answer must contain, and whether it must decline.
+- **Held-out phrasings:** `test_holdout.jsonl` uses question wording never seen in training.
+
+Built from the 200-run batch plus 120 wide-feed runs (seed 7), the dataset is 6,284 training, 776 validation, 795 test and 802 held-out test examples (about 11 MB). The baseline is the deterministic template answerer, which reads the same summary text with keyword rules:
+
+| Split | Template answerer pass rate | Hallucinated |
+|---|---|---|
+| test (training phrasings) | 100% | 0% |
+| test_holdout (new phrasings) | 85.4% | 0% |
+
+The template answerer only knows the training phrasings. On new wording it fails most "which channels are healthy?" questions (1%) and many "how do I fix it?" questions (34%). That is the gap the LLM is meant to close.
+
+**Training** (`training/train_lora.py`, on the GPU machine, in a new virtual environment):
+
+    python3 -m venv .venv-train
+    .venv-train/bin/pip install -r requirements.txt -r requirements-train.txt
+    .venv-train/bin/python -m training.train_lora --data out/qa --out out/model
+
+Defaults:
+- base model `Qwen/Qwen3.5-4B` (used for text only), with LoRA rank 16 on every linear layer of the language model (not the vision tower), and thinking mode turned off in the chat template;
+- bf16, 2 epochs (the Shannon run used 1, set by `EPOCHS` in `scripts/shannon_train.sh`), learning rate 2e-4, batch size 16, max length 1024 tokens;
+- loss on the answer tokens only.
+
+**Evaluation** (`training/evaluate.py`). An answer passes when it contains the required facts and declines when it should. A separate check flags any channel name or clock time that is not in the summary (a hallucination).
+
+    python -m training.evaluate --data out/qa --split test_holdout --answerer template
+    python -m training.evaluate --data out/qa --split test_holdout --answerer model
+    python -m training.evaluate --data out/qa --split test_holdout --answerer model --adapter out/model/adapter
+
+**Training run (2026-11-03, Shannon, RTX A6000).** `scripts/shannon_train.sh` with `EPOCHS=1`, other settings at their defaults:
+- 393 steps over the 6,284 training examples; the longest example is 555 tokens;
+- 32.5 M trainable parameters (0.77% of 4.24 B);
+- 68 minutes of training, about 41 GB of GPU memory, flash-linear-attention kernels;
+- final validation loss 0.0029;
+- the adapter is 144 MB (`out/model/adapter`, on Shannon only).
+
+One epoch was enough, because validation loss was already near zero, so the second epoch was not run.
+
+**Results.** Pass means the answer has every required fact and declines when it should. Hallucinated means it names a channel or clock time that is not in the summary. The base model was scored on the first 400 examples of each split to save GPU time.
+
+| Answerer | test (training phrasings) | test_holdout (new phrasings) | Hallucinated |
+|---|---|---|---|
+| Template (keyword rules) | 100% (795) | 85.4% (802) | 0% |
+| Qwen3.5-4B base, no fine-tuning | 72.5% (400) | 73.5% (400) | 0% |
+| **Qwen3.5-4B + LoRA (this repo)** | **100% (795)** | **100% (800)** | **0%** |
+
+Per question type on `test_holdout`, where the three answerers differ:
+
+| Question type | n | Template | Base model | Fine-tuned |
+|---|---|---|---|---|
+| which channels are normal | 97 | 1.0% | 88.0% (50) | 100% |
+| why / what to do (must decline) | 32 | 34.4% | 100% (19) | 100% |
+| a named normal channel | 180 | 100% | 11.5% (87) | 100% |
+| how big | 36 | 100% | 0% (22) | 100% |
+| every other type | 455 | 100% | 95 to 100% | 100% |
+
+Reading the results:
+- The fine-tuned model closes the gap left by the template answerer on new wording. That gap is listing the healthy channels, and declining "why" and "how do I fix it".
+- The base model fails mostly on two things. It does not give the exact "normal" wording and value for a named healthy channel, and it does not give the size of a deviation in the expected form. The fine-tuning teaches the answer format.
+- Both test splits come from the same simulator and summary builder as the training data. They test new wording, not new kinds of summaries. The QT-name and end-to-end checks below go a step further.
+
+**QT channel names never seen in training** (`out/qa_v2`, `test_holdout`, 794 examples, run by `scripts/shannon_post_eval.sh`). The v1 training data used the older QT names. The v2 held-out set uses the display names now in `configs/ptdb_layout.yaml`, such as "FC501 controller output" and "AIT501 analyzer", together with the new phrasings:
+
+| Answerer | Pass | Hallucinated |
+|---|---|---|
+| Template | 86.1% | 0% |
+| Qwen3.5-4B + LoRA | 100% | 0% |
+
+The model copies channel names from the summary instead of memorising them, so renaming channels in the layout does not need retraining.
+
+## End-to-end test
+
+`scripts/run_end_to_end.py` runs the whole chain on realistic simulated data with known answers:
+
+    simulated ptdb-shaped SQLite fixture
+      -> live reader (read-only adapter, paging by id, reorder, dedup)
+      -> detectors -> state store -> summary
+      -> answerer (template or fine-tuned model), checked fact by fact
+
+The data copies what the real profile showed. The healthy model is fitted to `out/profile/ptdb_profile.json` where it exists, and it includes:
+- partial rows with 30 to 64 percent NULLs;
+- late and duplicate rows;
+- a channel held at the sentinel-like value -41030.7;
+- a channel that barely moves;
+- the measured feed periods.
+
+Seven anomalies with known answers are planted on real channel names: a QT pressure drift, a QT flow spike, a 30 minute Flow_Rates outage, a QT temperature step, a stuck QT temperature, a 15 minute QT pressure dropout, and a Labjack temperature step.
+
+    python scripts/run_end_to_end.py --hours 12 --seed 2026                    # template answerer
+    python scripts/run_end_to_end.py --hours 12 --answerer model --adapter out/model/adapter   # GPU machine
+
+Results with the template answerer: 12 h runs, a 24 h healthy calibration run, five seeds:
+
+| | Result |
+|---|---|
+| Planted anomalies detected | 35 of 35 (7 per seed) |
+| False alarms | 4 in 60 h over 29 channels (0, 0, 1, 2, 1 per seed) |
+| Duplicates dropped by the reader | all; no late rows lost |
+| Template answers passing their checks (held-out phrasings) | 83 to 91 percent, with no hallucinated names or times |
+
+Results with the fine-tuned model answering (`scripts/shannon_post_eval.sh`, Shannon, 12 h runs, seeds 2026 and 99, about 7 minutes per run):
+
+| | Seed 2026 | Seed 99 |
+|---|---|---|
+| Planted anomalies detected | 7 of 7 | 7 of 7 |
+| False alarms | 0 | 1 (Flow_Rates.microwave_flow drift, see below) |
+| Duplicates dropped / late rows lost | 1,093 / 0 | 1,023 / 0 |
+| Model answers passing (held-out phrasings) | 121 of 121 | 123 of 123 |
+| Hallucinated names or times | 0 | 0 |
+
+The detection delays are 0 s for the spike, 13 s for the feed outage, 25 s for the dropout and about 1 minute for the stuck sensor and the steps. The drift alarm fires 1.5 to 2.5 minutes before the label's start time. The label marks the start of the ramp, and the CUSUM adds up the first part of the ramp together with healthy wander. The scorer counts that as detected through its grace window. The steps are reported as drifts in the expected direction, which the scorer treats as a match.
+
+The remaining false alarms are understood:
+- Three are drift alarms on channels whose fitted slow wander is as large as their short-term noise (Flow_Rates.microwave_flow, Labjack.magnet_bottom_temperature, Labjack.magnet_top_temperature). A 1 sigma wander with a 2 h period looks like a slow drift to a CUSUM. Calibrating on longer healthy periods helps: with 6 h of calibration instead of 24 h, there were 4 false alarms on a single seed.
+- One is a single 5 sigma spike on a QT channel, which noise alone produces about once every few runs at 16 channels and 1 row per second.
+
+The test suite runs a short version of this (`tests/test_end_to_end.py`).
+
+Two bugs this test found and fixed:
+- **A planted spike could land on a healthy NULL and vanish.** The simulator now never hides a planted spike.
+- **The "missing" timer kept counting through a feed outage,** so every channel of the feed looked missing when it came back. The timer now restarts when the feed returns. The missing limit also comes from each channel's healthy NULL rate, targeting one false alarm per channel per 30 days.
+
+### Full test on real data (run it yourself, read-only)
+
+    cd ~/spinquest-discord-anomaly-checker
+    bash scripts/shannon_realtest.sh
+
+It asks for the database password once and keeps it only in that process. Then it:
+1. profiles QT (aggregates only);
+2. sets QT's period in the layout from that profile;
+3. runs the monitor on real data from the start of the most recent logger run (2026-08-14 19:10 UTC): 12 hours of calibration, then 24 hours of monitoring, through the live reader;
+4. asks the fine-tuned model five questions about the latest real summary.
+
+Every statement passes the read-only guard, and the session is read-only. The outputs are in `out/profile_qt/` and `out/monitor/real/`; review them before sharing.
+
+## Discord bot
+
+`bot/discord_bot.py` reads the monitor's `summary.txt` and answers with the fine-tuned model, or with the template answerer if no adapter is given. The bot sees only the summary and the question.
+
+    pip install -r requirements-bot.txt
+    export DISCORD_BOT_TOKEN=...          # environment only, never a file in the repo
+    python -m bot.discord_bot --monitor-dir out/monitor/ptdb --adapter out/model/adapter
+    python -m bot.discord_bot --monitor-dir out/monitor/seed1_stress --ask "anything wrong?"   # offline check
+
+In Discord, mention the bot with a question, or use `!ask <question>` or `!status`. Enable the Message Content intent in the Discord developer portal.
+
+## Repo layout
+
+    configs/
+      healthy.yaml          six healthy hours, no anomalies (detector calibration)
+      mixed_demo.yaml       six hours: drift, spikes, step shift, decoupling
+      ptdb_layout.yaml      real ptdb table and column layout (R1)
+    sim/
+      scenario.py channels.py anomalies.py labels.py stream.py io.py batch.py   the simulator (Phases 1 and 2)
+      plotting.py           inspection plots (Phase 3, and SIMULATED feed plots)
+      ptdb_schema.py registry.py                  real layout (R1)
+      layout_scenario.py layout_io.py layout_recipes.py db_writer.py   wide feeds and SQLite fixture (R2)
+      profiler/             guard, adapters, statistics, allowlist schema, report (R3)
+      from_profile.py       fit to a profile (R4)
+    monitor/
+      detectors.py engine.py state.py summary.py  detectors, state store, summary
+      ingest.py             live reader for ptdb-shaped tables
+      scoring.py            detector scoring against labels (Phase 5)
+    training/
+      qa.py summary_parse.py make_dataset.py      Q&A dataset
+      modeling.py train_lora.py evaluate.py       model loading (Qwen3.5-4B), fine-tuning, evaluation
+    bot/
+      discord_bot.py answerer.py                  Discord bot
+    scripts/
+      make_run.py make_batch.py plot_run.py show_registry.py
+      make_layout_scenario.py make_fixture_db.py profile_db.py compare_sim_to_profile.py
+      run_monitor.py score_detectors.py run_end_to_end.py
+      shannon_profile.sh shannon_train.sh shannon_post_eval.sh shannon_realtest.sh   (Shannon helpers)
+    tests/                  pytest suite
+    out/                    generated data, profiles, models (gitignored)
 
 ## Known limits
 
-- With `--n 200` a few anomaly types can be absent from the 20-run val or test split (master seed 1: `transient_decay` in val, `dropout` in test). A larger `--n` or a stratified split would fix this.
+- With `--n 200`, a few anomaly types can be missing from the 20-run val or test split (master seed 1: `transient_decay` in val, `dropout` in test). Phase 5 scoring therefore uses all splits.
+- The healthy model is stationary. It has no operating modes (cooldown, warmup, beam on or off), regime changes or bursty noise. Real data almost certainly has them, so detectors calibrated on one healthy period will alarm on mode changes. The real profile (R3) is the first step to finding out.
+- Strong noise growth can also trip the drift CUSUM, because large random swings add up.
+- Spikes below 5 sigma are not detected, by design.
+- An anomaly on a channel that is already in alarm does not raise a new alarm (it is "masked").
+- On a coupled channel, the dashed baseline in the plots is the configured flat value. A healthy coupled channel moves away from it when its source drifts.
+- The LLM is trained on summaries from simulated runs. Its answers are only as good as the detectors and the summary, and it is not tested on real summaries yet. Its test scores are high because every summary comes from one fixed builder. A change to the summary format needs a new dataset and retraining.
+- The model is meant for a GPU. On the A6000, each 12 h end-to-end run took about 7.5 minutes, including the detectors and about 120 model answers. Answer latency on its own was not measured, and on CPU it will be much slower. The template answerer is the fallback.

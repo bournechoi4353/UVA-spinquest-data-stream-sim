@@ -1,0 +1,11 @@
+# Training and model inference (GPU machine). Install into a NEW virtual environment only:
+#   python3 -m venv .venv-train && .venv-train/bin/pip install -r requirements.txt -r requirements-train.txt
+# The exact installed set is frozen in requirements-train.lock.txt after install.
+# Qwen/Qwen3.5-4B needs transformers 4.57 or newer.
+transformers==5.22.1
+peft==0.21.2
+accelerate
+torch
+safetensors
+sentencepiece
+flash-linear-attention==0.6.0

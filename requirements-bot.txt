@@ -1,0 +1,2 @@
+# Discord bot. The token comes from the DISCORD_BOT_TOKEN environment variable only.
+discord.py==2.4.0
