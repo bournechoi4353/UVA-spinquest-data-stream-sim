@@ -46,7 +46,7 @@ Everything in this repo runs on synthetic data. No real experiment data is store
 | LLM | Q&A dataset, LoRA training, evaluation | Done: Qwen3.5-4B LoRA trained on Shannon, 100% on held-out phrasings (see [LLM training](#llm-training)) |
 | Bot | Discord bot | Done (not connected to Discord) |
 
-Tests: 255 passing (`pytest`).
+Tests: 257 passing (`pytest`).
 
 ## Runbook: run everything on another computer
 
@@ -96,7 +96,7 @@ Files that are not in git (all under `out/`, gitignored) and whether you need th
     .venv/bin/pip install -r requirements.txt          # Windows: .venv/Scripts/python -m pip install -r requirements.txt
     .venv/bin/python -m pytest -q
 
-Expected result: `255 passed`, in about 75 s.
+Expected result: `257 passed`, in about 80 s.
 
 ### R.3 Simulated data and the detector benchmark
 
@@ -277,7 +277,9 @@ What was done, in order, with what was decided and why.
 | 2026-11-04 | Fixes for the second real test | Feed-outage limits learned from healthy gaps; `coverage.txt` names unmonitored channels; `alarms.jsonl` logs every condition; `scripts/summarize_alarms.py` digest; default window 2025-11-03 + 24 h calibration + 6 days; QT period 1.878 s in the layout. 249 tests |
 | 2026-11-04 | Second real-data test: 2025-11-04 to 11-10 (6 days), 24 h calibration (`real_2025-11-03`) | All 29 channels monitored; outage limits about 145 s. 1,086 alarms (7.5/h). About 70% came from four patterns: LIT501 toggling between two readout codes (474), FC502 constant in calibration (135), one Flow_Rates writer absent about 60% of the week (magnet, main and separator flow, 120), and a Labjack gap every midnight Eastern (34). Many noisy and drift alarms were the same condition switching on and off. Candidate real events for Jay: a 2.5 min logger pause at 11-05 05:01 UTC; PT502 down at 11-06 03:38; magnet temperatures up at 11-06 07:10; PT503 down at 11-08 11:05; magnet flow up at 11-08 14:44; a TI523 noise burst at 11-08 15:41. Separator flow's fixed-size jumps (median 0.50) and main flow's (median 0.21) appear here too. The model answered all 5 questions correctly from the summary |
 | 2026-11-04 | Fixes from that test | Held-value and constant-channel sigma; a 1 sigma drift gate with settling and re-arming; noise hysteresis; missing limit at least 1.5 times the largest healthy gap; digest episodes and "channels that alarm together". The plain baseline is unchanged. Simulated benchmark: detection rates unchanged, false alarms 0.049 to 0.021 per hour, drifts detected later (median 83 s instead of 3 s); end to end 21 of 21 over 3 seeds, 0 false alarms. 255 tests |
-| next | Third real-data test on the same week with 72 h calibration (`real_2025-11-01`) to compare with `real_2025-11-03`; Jay's answers (separator flow, the logger stopping on 2026-08-17, modes, the candidate events); Discord setup (R.10) | Waiting on you |
+| 2026-11-04 | Third real-data test: the same week, 72 h calibration plus the fixes (`real_2025-11-01`) | Non-spike alarms 492 to 233 raised (142 episodes). Noisy 139 to 12, FC501 108 to 0, FC502 135 to 43, the Labjack midnight gaps 34 to 0. The three flows are reported as one writer (together 40 times). The summary at the end shows 3 abnormal channels instead of 11, and all model answers were correct. Remaining: LIT501's 571 identical +0.0898 spikes. The PT502 and PT503 drops and the 2.5 min logger pause are no longer flagged: the 72 h calibration includes similar levels and the midnight pauses, so they need Jay's judgement. Still flagged in both runs: the magnet temperatures rising on 11-06 at about 07:30, and the purifier inlet pressure on 11-08 and 11-09 |
+| 2026-11-04 | Fix from that test | Spike patterns learned from healthy data (3 or more healthy spikes raise the threshold to 1.2 times the largest). Bot answers may be up to 400 tokens (one "why" answer was cut off at 200). Simulated benchmark and end to end unchanged. 257 tests |
+| next | Fourth real-data test (`NAME=real_2025-11-01_v3`); Jay's answers (separator flow, the logger stopping on 2026-08-17, modes, the candidate events); Discord setup (R.10) | Waiting on you |
 
 ## Setup
 
@@ -709,7 +711,7 @@ After that, set `nominal_period_s` for QT in `configs/ptdb_layout.yaml` to the p
 
 | Detector | Rule |
 |---|---|
-| spike | \|z\| > 5 against an adaptive mean (alpha 0.01, not updated on flagged points). Confirmed only when the next sample is back within 3 sigma and the value is at least 3 sigma from the healthy target, so a step is not reported as a spike |
+| spike | \|z\| > 5 against an adaptive mean (alpha 0.01, not updated on flagged points). Confirmed only when the next sample is back within 3 sigma and the value is at least 3 sigma from the healthy target, so a step is not reported as a spike. In the adaptive mode, the spike detector is also run over the healthy data. If it finds 3 or more spikes there, they are part of the channel's normal behaviour, and its threshold becomes 1.2 times the largest of them (for example QT LIT501, which jumps by exactly +0.0898 about four times an hour) |
 | drift_up, drift_down | Two-sided CUSUM against the frozen target: slack 0.5 sigma, inputs clipped to 3 sigma, `since` = when the score left zero, score capped at 2 h so it clears soon after recovery. In the adaptive mode, the recent mean deviation (an EWMA over about 100 samples) must also be at least 1 sigma. The alarm ends after 30 minutes below 1 sigma, and after that the same side needs 2 sigma until its CUSUM returns to 0, so a channel sitting just above the slack neither alarms nor flaps |
 | stuck | The same value for at least 20 samples and 60 s |
 | noisy | An EWMA of squared sample-to-sample differences above 4 times its healthy level (level changes do not count as noise). It ends only after 30 samples in a row below the clear level, so noise at the threshold does not flap |

@@ -34,7 +34,7 @@ class TemplateAnswerer:
 class ModelAnswerer:
     name = "model"
 
-    def __init__(self, base_model: str, adapter: str | None = None, max_new_tokens: int = 200):
+    def __init__(self, base_model: str, adapter: str | None = None, max_new_tokens: int = 400):
         import torch
         from transformers import AutoTokenizer
 

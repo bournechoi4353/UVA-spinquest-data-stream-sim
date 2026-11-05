@@ -402,6 +402,39 @@ def test_two_code_toggling_level_sensor_is_not_a_spike_storm():
     assert sum(c.kind == "spike" for c in raised) == 0
 
 
+def test_recurring_healthy_spike_pattern_is_learned_but_bigger_spikes_still_report():
+    # LIT501 (2025-11): noisy baseline, and about 0.2% of readings jump by exactly +0.0898 for one reading
+    rng = np.random.default_rng(5)
+
+    def stream(n, extra=()):
+        v = -0.05 + rng.normal(0, 0.003, n)
+        hits = rng.random(n) < 0.002
+        v[hits] += 0.0898
+        for i, size in extra:
+            v[i] += size
+        return v
+
+    healthy = stream(100_000)
+    cal = calibrate(healthy, np.arange(100_000) * 2.0)
+    adapt_thresholds(healthy, cal, DetectorSettings())
+    assert cal.healthy_spikes >= 50 and cal.spike_z > 29
+    m = ChannelMonitor("lit", cal)
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    test = stream(50_000, extra=[(20_000, 0.30)])            # one jump 3x the familiar size
+    spikes = [c for i, x in enumerate(test) for c in m.update(t0 + timedelta(seconds=2 * i), float(x))
+              if c.kind == "spike"]
+    assert len(spikes) == 1 and spikes[0].magnitude == pytest.approx(0.30, abs=0.02)
+
+
+def test_a_few_healthy_spikes_do_not_raise_the_threshold():
+    rng = np.random.default_rng(6)
+    healthy = rng.normal(0, 1, 50_000)
+    healthy[[1000, 30_000]] += 9.0                            # two isolated spikes: maybe real, keep 5 sigma
+    cal = calibrate(healthy, np.arange(50_000.0))
+    adapt_thresholds(healthy, cal, DetectorSettings())
+    assert cal.healthy_spikes == 2 and cal.spike_z is None
+
+
 def test_channel_constant_in_calibration_does_not_give_thousand_sigma_alarms():
     # FC502 flow: constant 0.112124 for the whole calibration day, later moves by 0.0036
     cal = calibrate(np.full(5000, 0.112124), np.arange(5000) * 2.0)

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -116,6 +116,8 @@ class Calibration:
     stuck_normal: bool = False  # the channel holds values a lot when healthy: no stuck detection
     flat: bool = False          # every healthy value was identical (for example a channel reading 0)
     missing_after_s: float | None = None   # no value for this long counts as missing (wide feeds)
+    spike_z: float | None = None           # per-channel spike threshold (adaptive mode), else settings
+    healthy_spikes: int = 0                # confirmed spikes found in the healthy calibration data
 
 
 STUCK_NORMAL_SHARE = 0.2        # healthy share of repeated consecutive values above which "stuck" is off
@@ -190,6 +192,8 @@ def calibrate(values: np.ndarray, times_s: np.ndarray | None = None, default_per
 
 
 ADAPT_MARGIN = 1.5
+SPIKE_PATTERN_MIN = 3          # this many healthy spikes make them part of the channel's normal behaviour
+SPIKE_MARGIN = 1.2             # then only spikes 1.2 x larger than the largest healthy one are reported
 FALSE_ALARM_DAYS = 30.0        # design target: one false drift alarm per channel per 30 days
 
 
@@ -255,6 +259,33 @@ def adapt_thresholds(values: np.ndarray, cal: Calibration, s: DetectorSettings,
     arl = 2.0 * FALSE_ALARM_DAYS * 86400.0 / max(cal.period_s, 1e-3)     # two one-sided CUSUMs
     cal.cusum_h = max(s.cusum_threshold, siegmund_h(arl, s.cusum_slack), margin * best)
     cal.noisy_level = max(s.noisy_ratio ** 2 * cal.diff_var, margin * best_var)
+    learn_spikes(v, cal, s)
+    return cal
+
+
+def learn_spikes(values: np.ndarray, cal: Calibration, s: DetectorSettings) -> Calibration:
+    """Raise a channel's spike threshold when spikes are part of its healthy behaviour.
+
+    Some real channels have recurring single-reading jumps while healthy, for example QT LIT501,
+    whose readings jump by exactly +0.0898 about four times an hour (2025-11), most likely a
+    readout effect. The spike detector is run over the healthy data. If it finds at least
+    SPIKE_PATTERN_MIN spikes, the channel's threshold becomes SPIKE_MARGIN times the largest of
+    them (never below spike_z), so the familiar pattern is not reported and only clearly larger
+    spikes are. Fewer healthy spikes leave the threshold alone: one or two may be real events.
+    """
+    m = ChannelMonitor("_healthy", cal, s)
+    t0 = datetime(2000, 1, 1)
+    step = timedelta(seconds=max(cal.period_s, 1e-3))
+    sizes = []
+    for i, x in enumerate(values):
+        if x != x:
+            continue
+        for c in m.update(t0 + i * step, float(x)):
+            if c.kind == "spike" and c.peak_sigma is not None:
+                sizes.append(abs(c.peak_sigma))
+    cal.healthy_spikes = len(sizes)
+    if len(sizes) >= SPIKE_PATTERN_MIN:
+        cal.spike_z = max(s.spike_z, SPIKE_MARGIN * max(sizes))
     return cal
 
 
@@ -319,7 +350,7 @@ class ChannelMonitor:
         # 1. spike against the adaptive mean (no update on flagged points). A flagged sample is
         #    confirmed as a spike only when the next sample is back within spike_return_z; if the
         #    next one is flagged too, it is a level change (left to the CUSUM), not a spike.
-        flagged = abs(z) > s.spike_z and self.drift is None
+        flagged = abs(z) > (cal.spike_z or s.spike_z) and self.drift is None
         if self.pending_spike is not None:
             # Back near normal, and far enough from the healthy target: it really was a spike.
             # (A step ending can look like a jump against the lagging adaptive mean.)
