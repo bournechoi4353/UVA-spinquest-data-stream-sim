@@ -25,9 +25,10 @@ Everything in this repo runs on synthetic data. No real experiment data is store
 13. [Real ptdb layout (Phases R1 to R4)](#real-ptdb-layout-phases-r1-to-r4)
 14. [Monitoring pipeline](#monitoring-pipeline)
 15. [LLM training](#llm-training)
-16. [Discord bot](#discord-bot)
-17. [Repo layout](#repo-layout)
-18. [Known limits](#known-limits)
+16. [Simulated live ptdb](#simulated-live-ptdb)
+17. [Discord bot](#discord-bot)
+18. [Repo layout](#repo-layout)
+19. [Known limits](#known-limits)
 
 ## Status
 
@@ -46,7 +47,7 @@ Everything in this repo runs on synthetic data. No real experiment data is store
 | LLM | Q&A dataset, LoRA training, evaluation | Done: Qwen3.5-4B LoRA trained on Shannon, 100% on held-out phrasings (see [LLM training](#llm-training)) |
 | Bot | Discord bot | Done (not connected to Discord) |
 
-Tests: 257 passing (`pytest`).
+Tests: 262 passing (`pytest`).
 
 ## Runbook: run everything on another computer
 
@@ -96,7 +97,7 @@ Files that are not in git (all under `out/`, gitignored) and whether you need th
     .venv/bin/pip install -r requirements.txt          # Windows: .venv/Scripts/python -m pip install -r requirements.txt
     .venv/bin/python -m pytest -q
 
-Expected result: `257 passed`, in about 80 s.
+Expected result: `262 passed`, in about 90 s.
 
 ### R.3 Simulated data and the detector benchmark
 
@@ -224,6 +225,17 @@ What to look at:
 - **Alarm rates per channel in `digest.txt`:** each alarm is either a real event (ask Jay) or a false alarm, for example a mode change, a held value, or the separator flow jumps of about 0.5.
 - **Feed outages:** with limits learned from healthy gaps, these should be real logger pauses.
 
+### R.9b Simulated live ptdb (while the logger is off)
+
+The logger last ran on 2026-08-17 (Jay, 2026-11-04), so ptdb has nothing live to watch. `scripts/live_sim.py` stands in for it (see [Simulated live ptdb](#simulated-live-ptdb)). It runs on any computer and needs no database and no GPU:
+
+    python scripts/live_sim.py --out out/live/demo --history-hours 24 --live-hours 12 --speed 60     # terminal 1
+    python scripts/run_monitor.py --sqlite out/live/demo/live.sqlite --follow --poll-seconds 5 \
+        --calibrate-minutes 1440 --every-minutes 30 --name live_demo                               # terminal 2
+    python scripts/live_sim.py --score out/live/demo --monitor-dir out/monitor/live_demo           # afterwards
+
+Expected result: 7 of 7 planted anomalies found and 0 false alarms (a 6 h + 6 h trial at 1200x, 2026-11-04).
+
 ### R.10 Live monitoring and the Discord bot (GPU machine)
 
 Live monitor: it backfills from `--since`, calibrates on the first 12 h, then keeps polling every 30 s and rewrites `summary.txt`:
@@ -279,7 +291,10 @@ What was done, in order, with what was decided and why.
 | 2026-11-04 | Fixes from that test | Held-value and constant-channel sigma; a 1 sigma drift gate with settling and re-arming; noise hysteresis; missing limit at least 1.5 times the largest healthy gap; digest episodes and "channels that alarm together". The plain baseline is unchanged. Simulated benchmark: detection rates unchanged, false alarms 0.049 to 0.021 per hour, drifts detected later (median 83 s instead of 3 s); end to end 21 of 21 over 3 seeds, 0 false alarms. 255 tests |
 | 2026-11-04 | Third real-data test: the same week, 72 h calibration plus the fixes (`real_2025-11-01`) | Non-spike alarms 492 to 233 raised (142 episodes). Noisy 139 to 12, FC501 108 to 0, FC502 135 to 43, the Labjack midnight gaps 34 to 0. The three flows are reported as one writer (together 40 times). The summary at the end shows 3 abnormal channels instead of 11, and all model answers were correct. Remaining: LIT501's 571 identical +0.0898 spikes. The PT502 and PT503 drops and the 2.5 min logger pause are no longer flagged: the 72 h calibration includes similar levels and the midnight pauses, so they need Jay's judgement. Still flagged in both runs: the magnet temperatures rising on 11-06 at about 07:30, and the purifier inlet pressure on 11-08 and 11-09 |
 | 2026-11-04 | Fix from that test | Spike patterns learned from healthy data (3 or more healthy spikes raise the threshold to 1.2 times the largest). Bot answers may be up to 400 tokens (one "why" answer was cut off at 200). Simulated benchmark and end to end unchanged. 257 tests |
-| next | Fourth real-data test (`NAME=real_2025-11-01_v3`); Jay's answers (separator flow, the logger stopping on 2026-08-17, modes, the candidate events); Discord setup (R.10) | Waiting on you |
+| 2026-11-04 | Fourth real-data test (`real_2025-11-01_v3`, spike learning) | Spikes 639 to 9 (LIT501 571 to 0; separator, main flow and TI505 patterns learned). Raw alarms over the three runs: 1,086, then 872, then 242. Episodes per day: 145, then 130, then 25 (about 15 counting the flow writer once). All 5 model answers correct, none cut off |
+| 2026-11-04 | Jay's answers | The logger last ran on 2026-08-17, so there is no live data until the next run; he suggested making a test data set. The separator flow spiking "could be a bug". During that run only QT should have been changing ("we were flowing gas through that to test the purifier"), so Flow_Rates and Labjack changes during purifier tests are suspect |
+| 2026-11-04 | Simulated live ptdb (`scripts/live_sim.py`, `sim/live.py`, `sim/realistic.py`) | Writes realistic simulated rows in real time or faster, with planted anomalies and ground truth. Trial (6 h history + 6 h live at 1200x, monitor following): 7 of 7 found, 0 false alarms. 262 tests |
+| next | The Discord test on the simulated live stream; Jay's labels for the November events and the next run date; QT-first reporting (optional) | Waiting on you |
 
 ## Setup
 
@@ -953,6 +968,22 @@ It asks for the database password once and keeps it only in that process. Then i
 
 Every statement passes the read-only guard, and the session is read-only. The outputs are in `out/profile_qt/` and `out/monitor/real/`; review them before sharing.
 
+## Simulated live ptdb
+
+`scripts/live_sim.py` with `sim/live.py` is a **simulated live database**, for testing the monitor and later the Discord bot while the real logger is off. All of its data is SIMULATED, and it looks like ptdb:
+- the real table and column names (Flow_Rates, Labjack, QT);
+- the healthy model fitted to `out/profile/ptdb_profile.json` when it exists;
+- the real quirks: partial rows with NULLs, 1% late rows, 1% duplicate rows, a sentinel-like constant, a channel that barely moves, and the measured feed periods.
+
+How it runs:
+1. **History:** `--history-hours` of healthy rows are written at once, so the monitor has data to calibrate on.
+2. **Live part:** each row is inserted when a simulated clock reaches its insert time. The clock runs at `--speed` times wall time: 1 is real time, 60 is one hour per minute.
+3. **Late rows:** a late row is inserted together with the rows around it, so its timestamp is earlier than rows already in the table, as with real late rows. The database uses SQLite WAL mode, so the monitor reads while rows are written.
+4. **Planted anomalies:** the same seven as the end-to-end test (`sim/realistic.py`), placed in the live part, mostly on QT, the system used for the purifier tests. Each is printed as it happens unless `--quiet`.
+5. **Outputs:** `labels.json` (the ground truth, never read by the monitor) and `live_info.json` sit next to `live.sqlite`. `--score` matches the monitor's `alarms.jsonl` against the labels and lists found, missed and false alarms.
+
+The monitor follows the file exactly as it would follow ptdb (`run_monitor.py --sqlite ... --follow`). When the logger runs again, `--sqlite FILE` becomes `--mysql`, and nothing else changes.
+
 ## Discord bot
 
 `bot/discord_bot.py` reads the monitor's `summary.txt` and answers with the fine-tuned model, or with the template answerer if no adapter is given. The bot sees only the summary and the question.
@@ -977,6 +1008,7 @@ In Discord, mention the bot with a question, or use `!ask <question>` or `!statu
       layout_scenario.py layout_io.py layout_recipes.py db_writer.py   wide feeds and SQLite fixture (R2)
       profiler/             guard, adapters, statistics, allowlist schema, report (R3)
       from_profile.py       fit to a profile (R4)
+      realistic.py live.py  realistic scenarios with known answers; the simulated live ptdb
     monitor/
       detectors.py engine.py state.py summary.py  detectors, state store, summary
       ingest.py             live reader for ptdb-shaped tables
@@ -989,7 +1021,7 @@ In Discord, mention the bot with a question, or use `!ask <question>` or `!statu
     scripts/
       make_run.py make_batch.py plot_run.py show_registry.py
       make_layout_scenario.py make_fixture_db.py profile_db.py compare_sim_to_profile.py
-      run_monitor.py score_detectors.py run_end_to_end.py
+      run_monitor.py score_detectors.py run_end_to_end.py summarize_alarms.py live_sim.py
       shannon_profile.sh shannon_train.sh shannon_post_eval.sh shannon_realtest.sh   (Shannon helpers)
     tests/                  pytest suite
     out/                    generated data, profiles, models (gitignored)
