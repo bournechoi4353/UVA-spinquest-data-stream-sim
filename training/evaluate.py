@@ -31,17 +31,32 @@ TIME = re.compile(r"\b\d{2}:\d{2}\b")
 NAME = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:[_.][A-Za-z0-9]+)+\b")
 
 
+STRONG_REFUSAL = re.compile(r"(summary (does not|doesn't) (say|mention|include|list|give|cover|show)|"
+                            r"can't predict|cannot predict|not in the summary|isn't in the summary|no information|"
+                            r"is not listed|isn't listed|not listed in the summary)", re.I)
+NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:e[-+]?\d+)?", re.I)
+
+
 def check(answer: str, summary: str, question: str, checks: dict) -> dict:
+    """Pass or fail one answer. The optional keys (must_include_any, no_refusal, strict_numbers) are
+    used by the hard set (training/hard_set.py); the regular sets only use the first three."""
     low = answer.lower()
     ok_inc = all(s.lower() in low for s in checks["must_include"] if not (checks["refusal"] and s in
                                                                             ("does not say", "can't predict",
                                                                              "does not mention")))
+    ok_any = all(any(s.lower() in low for s in group) for group in checks.get("must_include_any", []))
     ok_exc = not any(s.lower() in low for s in checks["must_not_include"])
     ok_ref = bool(REFUSAL.search(answer)) if checks["refusal"] else True
+    ok_noref = not STRONG_REFUSAL.search(answer) if checks.get("no_refusal") else True
+    numbers_bad = ([n for n in NUMBER.findall(answer) if n.lstrip("-") not in summary and n not in question]
+                   if checks.get("strict_numbers") else [])
     times_bad = [t for t in TIME.findall(answer) if t not in summary]
     names_bad = [n for n in NAME.findall(answer) if n not in summary and n not in question]
-    return {"pass": ok_inc and ok_exc and ok_ref, "hallucinated": bool(times_bad or names_bad),
-            "bad": times_bad + names_bad}
+    failed = [name for name, ok in (("must_include", ok_inc), ("must_include_any", ok_any), ("must_not_include", ok_exc),
+                                    ("refusal", ok_ref), ("no_refusal", ok_noref), ("strict_numbers", not numbers_bad))
+              if not ok]
+    return {"pass": not failed, "hallucinated": bool(times_bad or names_bad),
+            "bad": times_bad + names_bad + numbers_bad, "failed": failed}
 
 
 def template_answers(rows):
@@ -91,12 +106,26 @@ def main(argv=None) -> int:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--max-new-tokens", type=int, default=200)
     p.add_argument("--out", help="write per-example results as JSONL")
+    p.add_argument("--guard", action="store_true", help="pass every answer through bot/guard.py first")
+    p.add_argument("--rescore", metavar="RESULTS_JSONL",
+                   help="score the answers saved in an earlier --out file (same data and split) instead of "
+                        "generating new ones; no GPU needed")
     args = p.parse_args(argv)
 
     rows = [json.loads(line) for line in Path(args.data, f"{args.split}.jsonl").read_text(encoding="utf-8")
             .splitlines() if line.strip()][:args.limit]
-    answers = (template_answers(rows) if args.answerer == "template"
-               else model_answers(rows, args.model, args.adapter, args.batch_size, args.max_new_tokens))
+    if args.rescore:
+        saved = [json.loads(x) for x in Path(args.rescore).read_text(encoding="utf-8").splitlines() if x.strip()]
+        rows = rows[:len(saved)]
+        answers = [s["answer"] for s in saved]
+    else:
+        answers = (template_answers(rows) if args.answerer == "template"
+                   else model_answers(rows, args.model, args.adapter, args.batch_size, args.max_new_tokens))
+    if args.guard:
+        from bot.guard import guard
+        answers = [guard(r["messages"][1]["content"].split("Summary:\n", 1)[1].split("\n\nQuestion: ")[0],
+                         r["messages"][1]["content"].split("\n\nQuestion: ", 1)[1], a)[0]
+                   for r, a in zip(rows, answers)]
     by_intent = defaultdict(lambda: [0, 0, 0])
     results = []
     for r, a in zip(rows, answers):
@@ -110,6 +139,10 @@ def main(argv=None) -> int:
         results.append({"intent": r["intent"], "question": question, "answer": a,
                         "reference": r["messages"][2]["content"], **res})
     label = args.answerer if args.answerer == "template" else (args.adapter or args.model)
+    if args.rescore:
+        label = f"saved answers in {args.rescore}"
+    if args.guard:
+        label += " + guard"
     print(f"Answerer: {label}, split {args.split}, {len(results)} examples")
     print(f"{'intent':18} {'n':>5} {'pass':>7} {'hallucinated':>13}")
     for k in sorted(by_intent):

@@ -98,9 +98,19 @@ def spike_groups(store: StateStore, within_s: float = RECENT_SPIKE_S) -> list[di
 
 def build_summary(store: StateStore, recent_spike_s: float = RECENT_SPIKE_S) -> str:
     now = store.now
-    head = (f"Status at {now.strftime('%Y-%m-%d %H:%M')} UTC." if now else "Status: no data yet.")
+    if now is None:
+        # Nothing has arrived: do not list channels as "Normal" or feeds as "reporting".
+        return f"Status: no data yet. {len(store.channels)} channels monitored; no feed has sent any rows yet."
+    head = f"Status at {now.strftime('%Y-%m-%d %H:%M')} UTC."
     abnormal = store.abnormal_channels()
-    lines = [f"{head} {len(store.channels)} channels monitored, {len(abnormal)} abnormal."]
+    # Feeds that are out, or have never sent a row: their channels have no current data, so they
+    # are not listed as "Normal" (a stale "normal" is misleading; found with the hard question set).
+    stale_feeds = {f.name: f for f in store.feeds.values() if f.outage is not None or f.last_row is None}
+    stale = {name: [c.display_name for c in store.channels.values() if c.feed == name and not c.active]
+             for name in stale_feeds}
+    n_stale = sum(len(v) for v in stale.values())
+    extra = f", {n_stale} without current data" if n_stale else ""
+    lines = [f"{head} {len(store.channels)} channels monitored, {len(abnormal)} abnormal{extra}."]
     for ch in sorted(abnormal, key=lambda c: min(x.since for x in c.active.values())):
         conds = sorted(ch.active.values(), key=lambda c: _ORDER.index(c.kind) if c.kind in _ORDER else 99)
         parts = "; ".join(describe(ch, c, now) for c in conds)
@@ -111,13 +121,21 @@ def build_summary(store: StateStore, recent_spike_s: float = RECENT_SPIKE_S) -> 
         more = f", and spikes on {len(groups) - 6} more channels" if len(groups) > 6 else ""
         lines.append(f"Recent spikes (last {int(recent_spike_s // 60)} min): {items}{more}.")
     if store.feeds:
-        down = [f for f in store.feeds.values() if f.outage is not None]
-        if down:
-            lines.append("Feeds: " + "; ".join(
-                f"{f.name} has sent no rows since {fmt_time(f.outage.since, now)}" for f in down) + ".")
-        else:
-            lines.append("Feeds: all reporting.")
-    normal = [c.display_name for c in store.channels.values() if not c.active]
+        # A feed with an outage, or one that has never sent a row with a monitored value (seen on
+        # real ptdb data: Labjack sent nothing on 2026-08-17), is not "reporting".
+        parts = [f"{f.name} has sent no rows since {fmt_time(f.outage.since, now)}"
+                 for f in store.feeds.values() if f.outage is not None]
+        parts += [f"{f.name} has sent no rows yet" for f in store.feeds.values()
+                  if f.outage is None and f.last_row is None]
+        lines.append("Feeds: " + ("; ".join(parts) if parts else "all reporting") + ".")
+    for name, chans in stale.items():
+        if chans:
+            f = stale_feeds[name]
+            why = (f"{name} has sent no rows since {fmt_time(f.outage.since, now)}" if f.outage is not None
+                   else f"{name} has sent no rows yet")
+            lines.append(f"No current data ({why}): " + ", ".join(chans) + ".")
+    stale_names = {n for v in stale.values() for n in v}
+    normal = [c.display_name for c in store.channels.values() if not c.active and c.display_name not in stale_names]
     if normal:
         # Every normal channel is named, so a reader (or the LLM) never has to guess
         # whether an unlisted name is a real, healthy channel.

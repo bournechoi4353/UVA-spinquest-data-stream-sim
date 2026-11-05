@@ -16,6 +16,7 @@ DRIFT = re.compile(r"about (?P<dev>[^ ]+)(?: \S+)? (?P<dir>above|below) normal, 
 KINDS = [("running high", "drift_up"), ("running low", "drift_down"), ("stuck at a constant value", "stuck"),
          ("noisier than normal", "noisy"), ("not reporting values", "missing"), ("no longer tracking", "decoupled")]
 SPIKE_ONE = re.compile(r"^(?P<name>.+?) at (?P<t>\d{2}:\d{2}) \((?P<sig>[+-][\d.]+ sigma)\)$")
+STALE = re.compile(r"^No current data \((?P<why>(?P<feed>\S+) has sent no rows[^)]*)\): (?P<chans>.+)\.$")
 SPIKE_MANY = re.compile(r"^(?P<name>.+?): (?P<n>\d+) spikes, the last at (?P<t>\d{2}:\d{2}) \(up to (?P<sig>[+-][\d.]+ sigma)\)$")
 
 
@@ -26,7 +27,7 @@ def _split_items(text: str) -> list[str]:
 
 def facts_from_summary(summary: str) -> dict[str, Any]:
     f: dict[str, Any] = {"now": None, "n_channels": 0, "abnormal": [], "normal": [], "spikes": [],
-                         "feeds": [], "feeds_down": []}
+                         "feeds": [], "feeds_down": [], "stale": [], "no_data": summary.startswith("Status: no data yet.")}
     for line in summary.splitlines():
         line = line.strip()
         m = HEAD.match(line)
@@ -61,8 +62,13 @@ def facts_from_summary(summary: str) -> dict[str, Any]:
             continue
         if line.startswith("Feeds:"):
             f["feeds"] = ["(feeds)"]
-            for m2 in re.finditer(r"(\S+) has sent no rows since ((?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2})", line):
+            for m2 in re.finditer(r"(\S+) has sent no rows (?:since ((?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2})|yet)", line):
                 f["feeds_down"].append({"name": m2.group(1), "since": m2.group(2)})
+            continue
+        m = STALE.match(line)
+        if m:
+            f["stale"].append({"feed": m["feed"], "why": m["why"],
+                               "channels": [x.strip() for x in m["chans"].split(", ")]})
             continue
         if line.startswith("Normal: "):
             body = line[len("Normal: "):].rstrip(".")

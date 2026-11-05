@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from bot.guard import guard
 from training.qa import answer as template_answer
 from training.qa import to_chat
 from training.summary_parse import facts_from_summary
@@ -28,7 +29,7 @@ class TemplateAnswerer:
     name = "template"
 
     def __call__(self, summary: str, question: str) -> str:
-        return template_answer(facts_from_summary(summary), question)
+        return guard(summary, question, template_answer(facts_from_summary(summary), question))[0]
 
 
 class ModelAnswerer:
@@ -51,6 +52,9 @@ class ModelAnswerer:
         self.model = model.eval()
         self.device = device
         self.max_new_tokens = max_new_tokens
+        self.use_guard = True          # bot/guard.py checks every answer against the summary
+        self.last_raw: str | None = None
+        self.last_guard: list[str] = []
 
     def __call__(self, summary: str, question: str) -> str:
         from training.modeling import chat_prompt
@@ -59,4 +63,9 @@ class ModelAnswerer:
         with self.torch.no_grad():
             out = self.model.generate(**enc, max_new_tokens=self.max_new_tokens, do_sample=False,
                                       pad_token_id=self.tok.eos_token_id)
-        return self.tok.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        raw = self.tok.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        self.last_raw = raw
+        if not self.use_guard:
+            return raw
+        fixed, self.last_guard = guard(summary, question, raw)
+        return fixed

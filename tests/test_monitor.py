@@ -170,6 +170,30 @@ def test_empty_store_summary():
     assert build_summary(StateStore()).startswith("Status: no data yet.")
 
 
+def test_no_data_summary_does_not_claim_normal_or_reporting():
+    from monitor.state import StateStore
+    s = StateStore()
+    s.add_feed("QT", 2.0)
+    s.add_channel("QT.pt501_ai", Calibration(9.0, 0.01, 2.0), "PT501 pressure", None, "QT")
+    text = build_summary(s)
+    assert text.startswith("Status: no data yet.")
+    assert "Normal:" not in text and "all reporting" not in text
+
+
+def test_a_feed_that_never_sent_a_row_is_not_reporting():
+    # real ptdb, 2026-08-17: Labjack had no values at all, yet the summary said "Feeds: all reporting."
+    from monitor.state import StateStore
+    s = StateStore()
+    for f in ("QT", "Labjack"):
+        s.add_feed(f, 2.0)
+    s.add_channel("QT.pt501_ai", Calibration(9.0, 0.01, 2.0), "PT501 pressure", None, "QT")
+    t = datetime(2026, 8, 17, 21, 29, tzinfo=timezone.utc)
+    s.observe("QT.pt501_ai", t, 9.0)
+    s.feeds["QT"].last_row = t
+    text = build_summary(s)
+    assert "Feeds: Labjack has sent no rows yet." in text
+
+
 # ---- live reader ------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def stressed(tmp_path_factory):

@@ -92,7 +92,14 @@ def _overall(f: dict[str, Any], rng: random.Random, question: str = "") -> str:
     parts = []
     yes_no = bool(YES_NO.match(question.strip()))
     all_ok = bool(ALL_OK.search(question))
-    if not f["abnormal"]:
+    stale = [c for s in f.get("stale", []) for c in s["channels"]]
+    if f.get("no_data"):
+        return "There is no data yet: no feed has sent any rows, so nothing can be said about the channels."
+    if not f["abnormal"] and stale:
+        whys = "; ".join(s["why"] for s in f["stale"])
+        parts.append(f"No channel is abnormal, but {len(stale)} channels have no current data ({whys}). "
+                     f"The other {f['n_channels'] - len(stale)} channels are normal as of {f['now']} UTC.")
+    elif not f["abnormal"]:
         if all_ok:
             opener = "Yes, everything looks normal."
         elif yes_no:
@@ -125,6 +132,9 @@ def _about(f: dict[str, Any], name: str) -> str:
             extra = (f" It had a spike at {g['time']} ({g['sigma']})." if g["count"] == 1
                      else f" It had {g['count']} spikes recently, the last at {g['time']} (up to {g['sigma']}).")
         return f"{name} is normal right now.{extra}"
+    for s in f.get("stale", []):
+        if name in s["channels"]:
+            return f"{name} has no current data: {s['why']}. Its last state was normal."
     return f"The summary does not mention {name}, so I can't say anything about it."
 
 
@@ -286,7 +296,8 @@ def to_chat(summary: str, question: str, answer: str | None = None) -> list[dict
 # ---------------------------------------------------------------------------
 def _find_channel(facts: dict[str, Any], q: str) -> str | None:
     ql = q.lower()
-    names = [a["name"] for a in facts["abnormal"]] + facts["normal"]
+    names = ([a["name"] for a in facts["abnormal"]] + facts["normal"]
+             + [c for s in facts.get("stale", []) for c in s["channels"]])
     hits = [n for n in names if n.lower() in ql]
     return max(hits, key=len) if hits else None
 
