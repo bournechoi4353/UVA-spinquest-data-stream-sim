@@ -300,7 +300,9 @@ What was done, in order, with what was decided and why.
 | 2026-11-04 | Hard question sets (`training/hard_set.py`): 60 hand-written questions plus 802 scrambled held-out questions | Template answerer 60% and 64.5%. Two summary bugs found and fixed (no-data and never-reporting feeds). 268 tests |
 | 2026-11-04 | Hard sets on Shannon | Fine-tuned 75% on test_hard (82% counting 4 over-strict checks), 93.0% on test_noisy; base model 56.7% and 64.5%; template 60% and 64.5%. 6 serious failures (false reassurance, injection, wrong feed, stale data, a count, "Yes" to no data) |
 | 2026-11-04 | Fact guard (`bot/guard.py`) and "no current data" in the summary | The guard corrects the 5 serious failure types it covers and changed 0 of 1,597 correct answers. 284 tests |
-| next | Re-score the saved hard-set answers through the guard on Shannon (CPU); the Discord test on the simulated live stream; Jay's labels and the next run date | Waiting on you |
+| 2026-11-04 | Decision: no retraining | The bot is not used for anything critical, and the fact guard catches the dangerous failure types. What retraining would add is helpfulness on harmless cases (typos in prediction questions, misspelled names, stock answers), and a fair measure of it would need a fresh held-out set. Revisit only if real users' questions show a pattern worth training on |
+| 2026-11-04 | Hard sets rerun with the fixes | Fine-tuned 76.7% raw and **85.0% with the guard** on test_hard (93% re-graded by reading; serious failures 6 to 0); 93.1% on test_noisy; base model 60.0% |
+| next | The Discord test on the simulated live stream; Jay's labels and the next run date | Waiting on you |
 
 ## Setup
 
@@ -1152,6 +1154,9 @@ Every ideal answer passes its own checks (tested).
 | Template (keyword rules) | **60%** | **64.5%** (802) | 85.4% |
 | Qwen3.5-4B base | **56.7%** | **64.5%** (first 400) | 73.5% |
 | **Qwen3.5-4B + LoRA** | **75%** (45 of 60; 95% interval 63 to 84%) | **93.0%** (746 of 802) | 100% |
+| After the fixes (rerun on Shannon, 2026-11-04): Qwen3.5-4B + LoRA, raw | **76.7%** (46 of 60) | 93.0% | |
+| **Qwen3.5-4B + LoRA + fact guard** | **85.0%** (51 of 60; 95% interval 74 to 92%) | **93.1%** | |
+| Qwen3.5-4B base (rerun) | 60.0% | 64.5% | |
 
 Measured on Shannon, 2026-11-04 (`scripts/shannon_hard_eval.sh`). None of the answers named a channel or time that is not in the summary. But that check cannot see a real name or time **attached to the wrong thing**, and one answer did exactly that (failure 3 below), so read "0% hallucinated" as a lower bound.
 
@@ -1192,6 +1197,26 @@ The model is robust to typos, but when a question departs from the training temp
   The first four replace the answer with a factual one; the last two append a note. Tests (`tests/test_guard.py`) cover the five serious failures it can catch (failures 1, 2, 3, 4 and 6, with the model's real answers), plus the QT false premise. The guard changed **0 of the 1,597** correct reference answers in `test` and `test_holdout`. It does not fix failure 5 (counting).
 - **No current data (`monitor/summary.py`):** a feed that is out, or has never sent a row, no longer has its channels listed as "Normal". The header says "N without current data", and a line "No current data (QT has sent no rows since 13:58): …" lists them. The template answerer and the parser understand the line.
 - `training/evaluate.py --guard` scores answers through the guard, and `--rescore FILE` re-scores answers saved by an earlier run, without a GPU.
+
+**Effect of the fixes (Shannon rerun, 2026-11-04):**
+- **The summary fix alone** took the raw model from 75% to 76.7% on `test_hard`: questions about outages and stale data went from 50% to 100%.
+- **With the guard,** the score is **85.0%**:
+  - false premises 50% to 100%;
+  - no data 0% to 100%;
+  - injections 60% to 80%.
+- **On `test_noisy`,** the guard changes almost nothing (93.0% to 93.1%), as expected: those failures are harmless typo misreadings, not dangerous claims.
+- **The 9 remaining `test_hard` failures, read one by one: none is dangerous.**
+  - **5 are correct answers** that the strict checks failed:
+    - three used "PT501" or "TI503" instead of the exact display name: a two-part answer, the TI503 trick question, and the coworker injection (resisted correctly);
+    - the 2.03% answer is right;
+    - the spike count lists 6 channels "and 2 more" without stating 8.
+  - **4 are harmless weaknesses:**
+    - a contradictory "No, PT501 is running high";
+    - "and the other one?" answered with the normal list;
+    - "2+2" → "4";
+    - the raw database name `QT.pt501_ai` not recognised.
+- **Final:** **85% by the strict checks (51 of 60), 93% re-graded by reading (56 of 60), and serious failures down from 6 to 0.** The multi-part "regression" was the short-name check, not a real change.
+- **The checks were not loosened after seeing the results,** so both numbers are reported.
 
 The template answerer's failures show why these sets matter:
 - it answered **"Yes."** to "should I shut the system down?";
